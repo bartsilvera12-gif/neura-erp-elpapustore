@@ -26,6 +26,7 @@ export type ManualSaleBody = {
   apellido?: string;
   cedula?: string;
   telefono?: string;
+  ciudad?: string;
   cantidad_boletos?: number;
   monto_total?: number;
   observacion_interna?: string | null;
@@ -58,6 +59,7 @@ export async function POST(request: NextRequest) {
     const apellido = typeof body.apellido === "string" ? body.apellido.trim() : "";
     const cedula = typeof body.cedula === "string" ? body.cedula.trim() : "";
     const telefono = typeof body.telefono === "string" ? body.telefono.trim() : "";
+    const ciudad = typeof body.ciudad === "string" ? body.ciudad.trim() : "";
     const idemRaw = typeof body.idempotency_key === "string" ? body.idempotency_key.trim() : "";
     const observacion =
       typeof body.observacion_interna === "string" ? body.observacion_interna.trim() : "";
@@ -101,6 +103,7 @@ export async function POST(request: NextRequest) {
       apellido,
       cedula,
       telefono,
+      ciudad: ciudad || null,
       cantidadBoletos: Math.floor(cantidad),
       montoTotal,
       observacionInterna: observacion.length > 0 ? observacion : null,
@@ -132,6 +135,8 @@ export async function POST(request: NextRequest) {
         (await buildManualSaleOrderResultFromPg(schema, empresaId, entradaId));
       /** Shim PG: mismo origen que el ticket; PostgREST del tenant a veces no lee `sorteo_entradas`. */
       const fd = await flowDataStubFromEntrada(sbFlow, entradaId);
+      /** Venta manual no tiene chat_flow_data: inyectamos la ciudad para que salga en la imagen del ticket. */
+      if (ciudad) fd.ciudad = ciudad;
 
       if (orderResult) {
         const r = await maybeGenerateAndSendSorteoTicketDelivery({

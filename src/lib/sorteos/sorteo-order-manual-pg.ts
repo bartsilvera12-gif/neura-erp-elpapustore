@@ -41,6 +41,7 @@ export type SorteoManualCashInput = {
   apellido: string;
   cedula: string;
   telefono: string;
+  ciudad?: string | null;
   cantidadBoletos: number;
   /** Monto total informado por el operador (>= 0). */
   montoTotal: number;
@@ -227,6 +228,7 @@ export async function createSorteoManualCashSaleViaDirectPostgres(
 
     const wa = normalizeTelefonoSorteo(input.telefono);
     const ce = input.cedula.trim();
+    const ciudad = (input.ciudad ?? "").trim();
 
     let clienteId: string | null = null;
     const deletedClause = cliCols.has("deleted_at") ? "AND deleted_at IS NULL" : "";
@@ -243,13 +245,21 @@ export async function createSorteoManualCashSaleViaDirectPostgres(
     );
     if (findCli.rows[0]) {
       clienteId = findCli.rows[0].id;
+      /** Cliente existente: completar ciudad solo si vino y estaba vacía (no pisar una ya cargada). */
+      if (ciudad && cliCols.has("ciudad")) {
+        await client.query(
+          `UPDATE ${qsch}.clientes SET ciudad = $2
+           WHERE id = $1 AND (ciudad IS NULL OR trim(ciudad) = '')`,
+          [clienteId, ciudad]
+        );
+      }
     } else {
       const insCli = await client.query<{ id: string }>(
         `INSERT INTO ${qsch}.clientes (
            empresa_id, tipo_cliente, nombre_contacto, nombre, documento, telefono, ciudad, origen
-         ) VALUES ($1, 'persona', $2, $2, $3, $4, NULL, 'SORTEO')
+         ) VALUES ($1, 'persona', $2, $2, $3, $4, $5, 'SORTEO')
          RETURNING id`,
-        [input.empresaId, nombreCompleto, ce || null, wa]
+        [input.empresaId, nombreCompleto, ce || null, wa, ciudad || null]
       );
       clienteId = insCli.rows[0]?.id ?? null;
     }

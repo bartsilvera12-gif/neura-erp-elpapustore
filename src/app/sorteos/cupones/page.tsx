@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { Suspense } from "react";
 import {
   fetchSorteoCuponesOrdenesServer,
   fetchSorteosListServer,
@@ -8,7 +7,6 @@ import {
 } from "@/lib/sorteos/server-queries";
 import type { SorteoEntradaEstadoPago } from "@/lib/sorteos/types";
 import SorteoCuponesEstadoPagoFilter from "@/components/sorteos/SorteoCuponesEstadoPagoFilter";
-import SorteosCuponesManualClient from "@/components/sorteos/SorteosCuponesManualClient";
 import SorteoCuponesBatchPrintClient from "@/components/sorteos/SorteoCuponesBatchPrintClient";
 
 export const runtime = "nodejs";
@@ -111,9 +109,6 @@ export default async function SorteoCuponesPage({
           <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Cupones</h1>
           <p className="mt-1 text-sm text-slate-500">Órdenes con números de cupón generados</p>
         </div>
-        <Suspense fallback={null}>
-          <SorteosCuponesManualClient />
-        </Suspense>
       </div>
 
       {/* Tabs */}

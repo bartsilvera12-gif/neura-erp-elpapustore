@@ -57,6 +57,8 @@ export function isModuleSlugGranted(routeSlug: string, grantedSlugs: Set<string>
   }
   if (routeSlug === "gestion-clientes" && grantedSlugs.has("clientes")) return true;
   if (routeSlug === "notas_credito" && grantedSlugs.has("ventas")) return true;
+  /** Ítem de sidebar "Cupón manual": mismo permiso que Sorteos (la ruta vive en /sorteos/cupon-manual). */
+  if (routeSlug === "cupon_manual" && grantedSlugs.has("sorteos")) return true;
   return false;
 }
 

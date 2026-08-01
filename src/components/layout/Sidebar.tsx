@@ -190,6 +190,13 @@ const MENU_STRUCTURE: MenuItem[] = [
         : [{ label: "Tickets / Comprobantes", href: "/sorteos/tickets", exactMatch: true }],
   },
   {
+    key: "cupon_manual",
+    slug: "cupon_manual",
+    label: "Cupón manual",
+    href: "/sorteos/cupon-manual",
+    icon: Receipt,
+  },
+  {
     key: "etiquetas",
     slug: "etiquetas",
     label: "Etiquetas",
