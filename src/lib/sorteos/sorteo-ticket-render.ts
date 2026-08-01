@@ -13,6 +13,7 @@ export type SorteoTicketRenderInput = {
   clienteNombre?: string;
   documento?: string;
   telefono?: string;
+  ciudad?: string;
   numeroOrden: string;
   cupones: string[];
   /** ISO o texto localizable */
@@ -126,6 +127,7 @@ export function buildSorteoTicketSvg(input: SorteoTicketRenderInput): string {
   const showNombre = cfg.showClienteNombre !== false;
   const showDoc = cfg.showDocumento !== false;
   const showTel = cfg.showTelefono !== false;
+  const showCiu = cfg.showCiudad !== false;
   const showOrd = cfg.showNumeroOrden !== false;
   const showCup = cfg.showCupones !== false;
   const showSorteoNom = cfg.showSorteoNombre !== false;
@@ -171,6 +173,9 @@ export function buildSorteoTicketSvg(input: SorteoTicketRenderInput): string {
   }
   if (showTel && input.telefono?.trim()) {
     rows.push({ label: "Teléfono", value: input.telefono.trim() });
+  }
+  if (showCiu && input.ciudad?.trim()) {
+    rows.push({ label: "Ciudad", value: input.ciudad.trim() });
   }
   if (showOrd && String(input.numeroOrden ?? "").trim()) {
     rows.push({ label: "Nº de orden", value: String(input.numeroOrden).trim() });
@@ -307,6 +312,7 @@ function buildCustomTemplateOverlaySvg(
   const colName = fillAttr(layout.cliente_nombre.color);
   const colDoc = fillAttr(layout.cliente_documento.color);
   const colTel = fillAttr(layout.telefono.color);
+  const colCiu = fillAttr(layout.ciudad.color);
   const colOrd = fillAttr(layout.numero_orden.color);
   const colSort = fillAttr(layout.sorteo_nombre.color);
   const colCup = fillAttr(layout.cupones.color);
@@ -343,6 +349,15 @@ function buildCustomTemplateOverlaySvg(
         text: `Teléfono: ${tel}`,
         fs: r(Math.max(layout.telefono.fontSize, 28)),
         color: colTel,
+        weight: 600,
+      });
+    }
+    const ciu = input.ciudad?.trim();
+    if (ciu) {
+      rows.push({
+        text: `Ciudad: ${ciu}`,
+        fs: r(Math.max(layout.ciudad.fontSize, 28)),
+        color: colCiu,
         weight: 600,
       });
     }

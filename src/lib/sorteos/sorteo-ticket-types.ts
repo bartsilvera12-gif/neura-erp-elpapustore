@@ -18,6 +18,7 @@ export const DEFAULT_CUSTOM_TEMPLATE_FIELDS: Record<string, SorteoTicketCustomFi
   cliente_nombre: { x: 72, y: 0, fontSize: 32, color: "#111827" },
   cliente_documento: { x: 72, y: 0, fontSize: 26, color: "#374151" },
   telefono: { x: 72, y: 0, fontSize: 26, color: "#374151" },
+  ciudad: { x: 72, y: 0, fontSize: 26, color: "#374151" },
   numero_orden: { x: 72, y: 0, fontSize: 30, color: "#111827" },
   sorteo_nombre: { x: 72, y: 0, fontSize: 26, color: "#374151" },
   cupones: { x: 72, y: 0, fontSize: 56, color: "#111827" },
@@ -55,6 +56,7 @@ export type SorteoTicketImageConfig = {
   showClienteNombre?: boolean;
   showDocumento?: boolean;
   showTelefono?: boolean;
+  showCiudad?: boolean;
   showNumeroOrden?: boolean;
   showCupones?: boolean;
   showSorteoNombre?: boolean;

@@ -412,6 +412,7 @@ export async function maybeGenerateAndSendSorteoTicketDelivery(
       clienteNombre: normalized.clienteNombre.trim() || undefined,
       documento: normalized.documento.trim() || undefined,
       telefono: normalized.telefono.trim() || undefined,
+      ciudad: normalized.ciudad.trim() || undefined,
       numeroOrden: (normalized.numeroOrden || "").trim() || String(orderResult.numeroOrden),
       cupones: normalized.cupones,
       fechaHora,
