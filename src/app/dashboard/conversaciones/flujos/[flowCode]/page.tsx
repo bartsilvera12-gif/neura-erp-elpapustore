@@ -1322,7 +1322,6 @@ export default function FlowEditorPage() {
               <option key={opt.value} value={opt.value}>{opt.label}</option>
             ))}
           </select>
-          <p className="mt-1 text-[11px] text-slate-500">{nodeTypeHelp(newNodeType)}</p>
         </div>
         <button
           type="submit"
