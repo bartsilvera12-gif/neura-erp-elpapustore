@@ -1343,6 +1343,33 @@ export async function ensureSorteoOrderFromChat(
       .eq("empresa_id", input.empresaId);
   }
 
+  /**
+   * FIX recompra (datos del comprador): en un hit idempotente la entrada ya se había creado antes
+   * (paso de la imagen del comprobante) y puede haber quedado con datos que el cliente CORRIGIÓ
+   * después, entre enviar el comprobante y tocar "Confirmado". La rama idempotente devuelve la fila
+   * sin reescribir nombre/documento, así que esa corrección se perdía. Acá reescribimos con lo
+   * CONFIRMADO (`participant` deriva del flowData fresco del momento de la confirmación).
+   * - Es UPDATE por id ⇒ imposible duplicar la entrada; no cambia CUÁNDO se crea la orden.
+   * - Solo en idempotente: en un INSERT fresco los valores ya son los correctos.
+   * - Guard por campo: nunca pisamos con vacío (no borra un documento/nombre ya cargado).
+   * - No tocamos ciudad: el ticket/listado/impresión ya la toman del chat_flow_data fresco.
+   */
+  if (row.idempotent === true && entradaId) {
+    const nombreConfirmado = participant.nombre_completo.trim();
+    const cedulaConfirmada = participant.cedula.trim();
+    const patch: Record<string, unknown> = {};
+    if (nombreConfirmado) patch.nombre_participante = nombreConfirmado;
+    if (cedulaConfirmada) patch.documento = cedulaConfirmada;
+    if (Object.keys(patch).length > 0) {
+      patch.updated_at = new Date().toISOString();
+      await dbForTenantTables
+        .from("sorteo_entradas")
+        .update(patch)
+        .eq("id", entradaId)
+        .eq("empresa_id", input.empresaId);
+    }
+  }
+
   return {
     ok: true,
     skipped: false,
