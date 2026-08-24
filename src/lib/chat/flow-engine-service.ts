@@ -70,6 +70,7 @@ import {
 import { fetchDataSchemaForEmpresaId } from "@/lib/supabase/empresa-data-schema";
 import {
   describeFlowCaptureCompletenessForLogs,
+  isIdentityCaptureField,
   resolveEffectiveNodeCodeForFlowCompleteness,
 } from "@/lib/sorteos/sorteo-flow-capture-order";
 
@@ -1247,6 +1248,12 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       if (!key) continue;
       // No mezclar metadatos del comprobante de otro envío; el pipeline actual los define.
       if (key.startsWith("sorteo_comprobante_")) continue;
+      // No heredar la IDENTIDAD del participante (cedula/nombre/apellido/ciudad) de una compra
+      // ANTERIOR: en una recompra la sesión actual la vuelve a capturar, y heredarla hacía que la
+      // orden se creara temprano (paso del comprobante) con los datos viejos. Excluyéndola, el
+      // recomprador sigue el mismo camino del primer comprador (orden recién en la confirmación,
+      // con datos frescos). Mismo clasificador que el gate de completitud, para no divergir.
+      if (isIdentityCaptureField(key)) continue;
       const val = String((row as { field_value?: string }).field_value ?? "").trim();
       if (!val || !slotEmpty(key)) continue;
       merged[key] = val;

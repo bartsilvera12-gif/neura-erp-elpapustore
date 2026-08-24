@@ -40,6 +40,17 @@ function bucketForSaveField(saveAs: string): "cedula" | "nombre" | "apellido" | 
   return "other";
 }
 
+/**
+ * ¿Esta clave de guardado corresponde a un dato de IDENTIDAD del participante
+ * (cedula/documento, nombre, apellido, ciudad)? Usa el MISMO clasificador que el gate
+ * de completitud (`bucketForSaveField`), para que cualquier exclusión basada en identidad
+ * no pueda divergir de los buckets que deciden la creación de la orden. Cubre alias y
+ * acentos (ci/dni/ruc/nro_documento/numero_documento/cédula/nombres/apellidos/ubicación).
+ */
+export function isIdentityCaptureField(fieldName: string): boolean {
+  return bucketForSaveField(fieldName) !== "other";
+}
+
 /** ¿Hay valor no vacío en flow_data para esta clave de guardado o sus alias de bucket? */
 export function flowDataHasValueForCaptureSaveField(
   rawFlowData: Record<string, string>,
