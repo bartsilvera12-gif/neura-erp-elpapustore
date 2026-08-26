@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchWithSupabaseSession } from "@/lib/api/fetch-with-supabase-session";
 import {
   buildCampaignTemplatePreviewText,
@@ -143,16 +143,27 @@ export default function CampanasDetailClient({
     void load();
   }, [load]);
 
+  // Guard "en vuelo": nunca disparar /process si el anterior sigue corriendo. Sin esto, el
+  // setInterval acumulaba llamadas concurrentes cuando un batch tardaba > el intervalo, y cada
+  // una reenviaba a los mismos destinatarios (duplicados 3-7x). El claim atómico del server ya lo
+  // blinda; esto además evita llamadas al pedo.
+  const processingRef = useRef(false);
   useEffect(() => {
     if (!campaign || campaign.status !== "sending") return;
     const t = window.setInterval(() => {
+      if (processingRef.current) return;
+      processingRef.current = true;
       void (async () => {
-        await fetchWithSupabaseSession("/api/campanas/process", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ campaign_id: campaignId }),
-        });
-        await load();
+        try {
+          await fetchWithSupabaseSession("/api/campanas/process", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ campaign_id: campaignId }),
+          });
+          await load();
+        } finally {
+          processingRef.current = false;
+        }
       })();
     }, 4000);
     return () => window.clearInterval(t);

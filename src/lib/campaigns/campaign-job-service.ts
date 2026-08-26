@@ -73,13 +73,20 @@ export async function runCampaignProcessOnce(params: {
     return { processed: 0, remainingQueued: 0, campaignCompleted: st === "completed" || st === "cancelled" };
   }
 
+  // Recupera filas atascadas en 'sending' de una ejecución MUERTA (sin provider_message_id),
+  // pero SOLO si llevan >5 min así. Sin el filtro de antigüedad, esto re-encolaba envíos recién
+  // reclamados y todavía EN VUELO por otra ejecución concurrente → los reenviaba (duplicados).
+  // 5 min queda MUY por encima de cualquier envío real (que además, si lanza, ya se marca 'failed'
+  // por el try/catch de abajo): solo se re-encola lo que quedó colgado por caída dura del proceso.
+  const staleSendingBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   await supabase
     .from("chat_campaign_recipients")
     .update({ status: "queued", updated_at: new Date().toISOString() })
     .eq("empresa_id", empresaId)
     .eq("campaign_id", campaignId)
     .eq("status", "sending")
-    .is("provider_message_id", null);
+    .is("provider_message_id", null)
+    .lt("updated_at", staleSendingBefore);
 
   if ((campaign as { template_id?: string | null }).template_id) {
     const tid = (campaign as { template_id: string }).template_id;
@@ -139,21 +146,60 @@ export async function runCampaignProcessOnce(params: {
     }
 
     const ts = new Date().toISOString();
-    await supabase
+    // CLAIM ATÓMICO anti-duplicados: solo enviamos si ESTA ejecución logra pasar la fila de
+    // 'queued' a 'sending'. El UPDATE condicional toma el lock de fila en Postgres; si otra
+    // ejecución concurrente (otro /process, otra pestaña) ya la reclamó o ya la envió, matchea 0
+    // filas y salteamos → nunca se manda dos veces, sin importar cuántas corran en paralelo.
+    const { data: claimed, error: claimErr } = await supabase
       .from("chat_campaign_recipients")
       .update({ status: "sending", updated_at: ts })
       .eq("id", rec.id)
-      .eq("empresa_id", empresaId);
+      .eq("empresa_id", empresaId)
+      .eq("status", "queued")
+      .is("provider_message_id", null)
+      .select("id");
+    if (claimErr || !claimed || claimed.length === 0) {
+      // otra ejecución ya reclamó/envió este destinatario
+      continue;
+    }
 
-    const send = await sendCampaignRecipientMessage({
-      supabase,
-      campaign: campaign as CampaignOutboundRow,
-      recipient: {
-        id: rec.id,
-        phone_e164: rec.phone_e164,
-        mapped_variables_json: (rec.mapped_variables_json || {}) as Record<string, unknown>,
-      },
-    });
+    // Si el envío LANZA (excepción de red/DB), marcamos la fila 'failed' en vez de dejarla en
+    // 'sending': así la re-encolada NO la reintenta (evita un posible duplicado si Meta ya la había
+    // aceptado) y un throw no aborta el resto del batch.
+    let send: Awaited<ReturnType<typeof sendCampaignRecipientMessage>>;
+    try {
+      send = await sendCampaignRecipientMessage({
+        supabase,
+        campaign: campaign as CampaignOutboundRow,
+        recipient: {
+          id: rec.id,
+          phone_e164: rec.phone_e164,
+          mapped_variables_json: (rec.mapped_variables_json || {}) as Record<string, unknown>,
+        },
+      });
+    } catch (e) {
+      const emsg = e instanceof Error ? e.message : String(e);
+      await supabase
+        .from("chat_campaign_recipients")
+        .update({
+          status: "failed",
+          failed_at: ts,
+          error_message: emsg.slice(0, 2000),
+          error_code: "exception",
+          updated_at: ts,
+        })
+        .eq("id", rec.id)
+        .eq("empresa_id", empresaId);
+      await supabase.from("chat_campaign_events").insert({
+        empresa_id: empresaId,
+        campaign_id: campaignId,
+        recipient_id: rec.id,
+        event_type: "failed",
+        event_payload_json: { error: emsg, thrown: true },
+      });
+      processed += 1;
+      continue;
+    }
 
     if (send.ok) {
       await supabase
