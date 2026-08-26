@@ -51,7 +51,12 @@ export async function runCampaignProcessOnce(params: {
   empresaId: string;
   campaignId: string;
   batchSize?: number;
-}): Promise<{ processed: number; remainingQueued: number; campaignCompleted: boolean }> {
+}): Promise<{
+  processed: number;
+  remainingQueued: number;
+  campaignCompleted: boolean;
+  countsReliable: boolean;
+}> {
   const { supabase, empresaId, campaignId } = params;
   const batchSize = Math.min(100, Math.max(1, params.batchSize ?? DEFAULT_BATCH_SIZE));
 
@@ -65,12 +70,17 @@ export async function runCampaignProcessOnce(params: {
     .maybeSingle();
 
   if (cErr || !campaign) {
-    return { processed: 0, remainingQueued: 0, campaignCompleted: false };
+    return { processed: 0, remainingQueued: 0, campaignCompleted: false, countsReliable: true };
   }
 
   const st = String((campaign as { status?: string }).status ?? "");
   if (st !== "sending") {
-    return { processed: 0, remainingQueued: 0, campaignCompleted: st === "completed" || st === "cancelled" };
+    return {
+      processed: 0,
+      remainingQueued: 0,
+      campaignCompleted: st === "completed" || st === "cancelled",
+      countsReliable: true,
+    };
   }
 
   // Recupera filas atascadas en 'sending' de una ejecución MUERTA (sin provider_message_id),
@@ -114,7 +124,7 @@ export async function runCampaignProcessOnce(params: {
         event_type: "failed",
         event_payload_json: { reason: "template_no_longer_approved" },
       });
-      return { processed: 0, remainingQueued: 0, campaignCompleted: true };
+      return { processed: 0, remainingQueued: 0, campaignCompleted: true, countsReliable: true };
     }
   }
 
@@ -248,7 +258,7 @@ export async function runCampaignProcessOnce(params: {
 
   await refreshCampaignCounters(supabase, empresaId, campaignId);
 
-  const { count: remainingQueued } = await supabase
+  const { count: remainingQueued, error: rqErr } = await supabase
     .from("chat_campaign_recipients")
     .select("id", { count: "exact", head: true })
     .eq("empresa_id", empresaId)
@@ -257,14 +267,21 @@ export async function runCampaignProcessOnce(params: {
 
   const rq = remainingQueued ?? 0;
 
-  const { count: stillSending } = await supabase
+  const { count: stillSending, error: sendErr } = await supabase
     .from("chat_campaign_recipients")
     .select("id", { count: "exact", head: true })
     .eq("empresa_id", empresaId)
     .eq("campaign_id", campaignId)
     .eq("status", "sending");
 
-  if (rq === 0 && (stillSending ?? 0) === 0) {
+  // Solo completamos si AMBOS conteos son confiables (sin error y no-null). Un count nulo por un
+  // blip transitorio de kong NO debe leerse como 0: marcaría la campaña 'completed' con destinatarios
+  // aún en cola → pérdida silenciosa e irrecuperable. Si algún conteo falló, NO completamos y el
+  // driver/cron/navegador reintentan en el próximo tick.
+  const countsReliable =
+    !rqErr && !sendErr && remainingQueued != null && stillSending != null;
+
+  if (countsReliable && rq === 0 && stillSending === 0) {
     await supabase
       .from("chat_campaigns")
       .update({
@@ -292,8 +309,56 @@ export async function runCampaignProcessOnce(params: {
       .eq("campaign_id", campaignId)
       .eq("empresa_id", empresaId);
 
-    return { processed, remainingQueued: 0, campaignCompleted: true };
+    return { processed, remainingQueued: 0, campaignCompleted: true, countsReliable: true };
   }
 
-  return { processed, remainingQueued: rq, campaignCompleted: false };
+  return { processed, remainingQueued: rq, campaignCompleted: false, countsReliable };
+}
+
+/**
+ * Empuja una campaña 'sending' hasta completarla EN EL SERVER, sin depender de que el navegador
+ * tenga la pestaña abierta. Llama runCampaignProcessOnce en loop hasta que no queden 'queued' o
+ * hasta el presupuesto de tiempo (para el cron backstop). Es SEGURO correr en paralelo con el
+ * polling del navegador y/o el cron: el claim atómico de runCampaignProcessOnce garantiza un solo
+ * envío por destinatario. Nunca lanza (log-and-stop) para no tumbar el proceso Node.
+ */
+export async function driveCampaignToCompletion(params: {
+  supabase: SupabaseAdmin;
+  empresaId: string;
+  campaignId: string;
+  maxMs?: number;
+  batchSize?: number;
+}): Promise<{ processed: number; completed: boolean }> {
+  const deadline = Date.now() + (params.maxMs ?? 60 * 60 * 1000);
+  let processed = 0;
+  let completed = false;
+  for (;;) {
+    let r: Awaited<ReturnType<typeof runCampaignProcessOnce>>;
+    try {
+      r = await runCampaignProcessOnce({
+        supabase: params.supabase,
+        empresaId: params.empresaId,
+        campaignId: params.campaignId,
+        batchSize: params.batchSize ?? DEFAULT_BATCH_SIZE,
+      });
+    } catch (e) {
+      console.error("[campaign-driver] batch_error", {
+        campaign_id: params.campaignId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      break;
+    }
+    processed += r.processed;
+    if (r.campaignCompleted) {
+      completed = true;
+      break;
+    }
+    if (Date.now() > deadline) break;
+    // Sin 'queued' y sin progreso, y con conteos CONFIABLES: no queda nada por reclamar (otra
+    // ejecución finalizará si hay filas 'sending' en vuelo). Si los conteos no son confiables
+    // (blip de kong) NO cortamos: reintentamos hasta que se aclaren o venza el deadline.
+    if (r.remainingQueued === 0 && r.processed === 0 && r.countsReliable) break;
+    await new Promise((res) => setTimeout(res, r.processed === 0 ? 1000 : 300));
+  }
+  return { processed, completed };
 }

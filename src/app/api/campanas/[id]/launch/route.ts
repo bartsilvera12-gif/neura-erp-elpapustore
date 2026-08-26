@@ -13,7 +13,7 @@ import {
   variableMappingCoversTemplate,
 } from "@/lib/campaigns/campaign-mapping";
 import { extractBodyPlaceholderKeysOrdered } from "@/lib/campaigns/campaign-template-payload";
-import { runCampaignProcessOnce } from "@/lib/campaigns/campaign-job-service";
+import { driveCampaignToCompletion, runCampaignProcessOnce } from "@/lib/campaigns/campaign-job-service";
 import type { SupabaseAdmin } from "@/lib/chat/types";
 
 type RouteCtx = { params: Promise<{ id: string }> };
@@ -168,6 +168,20 @@ export async function POST(request: NextRequest, ctx: RouteCtx) {
       empresaId: auth.empresaId,
       campaignId,
       batchSize: 25,
+    });
+
+    // Empuja el RESTO en el server (proceso Node persistente), sin depender de que la pestaña
+    // quede abierta. Fire-and-forget: corre después de responder. El claim atómico lo hace seguro
+    // aunque el navegador también pollee /process. `.catch` evita unhandledRejection.
+    void driveCampaignToCompletion({
+      supabase: sb as unknown as SupabaseAdmin,
+      empresaId: auth.empresaId,
+      campaignId,
+    }).catch((e) => {
+      console.error("[campaign-launch] driver_error", {
+        campaign_id: campaignId,
+        error: e instanceof Error ? e.message : String(e),
+      });
     });
 
     return NextResponse.json(
