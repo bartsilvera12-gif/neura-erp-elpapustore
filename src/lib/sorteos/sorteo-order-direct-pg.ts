@@ -105,7 +105,34 @@ export async function ensureSorteoOrderViaDirectPostgres(
     return { ok: false, message: "No hay conexión directa a la base de datos configurada." };
   }
 
-  const client = await poolInst.connect();
+  // Reintenta el connect ante blips transitorios (ECONNREFUSED / timeout del pool). Si igual falla,
+  // devolvemos {ok:false} con mensaje EN VEZ de tirar crudo: antes la excepción subía sin catch y el
+  // paso quedaba MUDO — el cliente tocaba Confirmado y no se generaba la boleta ni un aviso. Ahora,
+  // o el reintento lo absorbe, o el cliente recibe un mensaje para reintentar.
+  let clientOrNull: pg.PoolClient | null = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      clientOrNull = await poolInst.connect();
+      break;
+    } catch (e) {
+      if (attempt >= 3) {
+        console.error(FLOW_SORTEO_LOG, "[order-create]", "[connect-failed]", {
+          schema: sch,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      } else {
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+      }
+    }
+  }
+  if (!clientOrNull) {
+    return {
+      ok: false,
+      message:
+        "No pudimos registrar tu compra en este momento por un problema de conexión. Tocá Confirmado de nuevo en unos segundos y listo.",
+    };
+  }
+  const client = clientOrNull;
   const qsch = quoteIdent(sch);
 
   try {
