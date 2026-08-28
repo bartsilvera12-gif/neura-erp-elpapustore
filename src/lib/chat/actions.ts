@@ -444,6 +444,22 @@ async function fetchChatConversationsUnsafe(
   const activeFlowCodeSet = buildActiveFlowMatchSet(activeFlowRows ?? []);
   const activeFlowCatalogRowCount = (activeFlowRows ?? []).length;
 
+  /**
+   * ¿El tenant usa ruteo humano (colas)? Si NO tiene colas, la separación Inbox/Bot no le aplica:
+   * casi todas sus conversaciones son del bot y el Inbox quedaría vacío. En ese caso el Inbox
+   * muestra TODAS las conversaciones abiertas (el Bot sigue mostrando sólo las del flujo bot).
+   */
+  let tenantUsesHumanRouting = false;
+  try {
+    const { count: queueCount, error: queueErr } = await supabase
+      .from("chat_queues")
+      .select("id", { count: "exact", head: true })
+      .eq("empresa_id", empresa_id);
+    if (!queueErr) tenantUsesHumanRouting = (queueCount ?? 0) > 0;
+  } catch (e) {
+    console.warn("[fetchChatConversations] chat_queues count:", e instanceof Error ? e.message : e);
+  }
+
   if (vista === "bot" && activeFlowCatalogRowCount === 0) {
     return { conversations: [], base_row_count: 0 };
   }
@@ -743,7 +759,16 @@ async function fetchChatConversationsUnsafe(
   let botLikeCount = 0;
   if (vista === "inbox") {
     botLikeCount = list.filter((row) => isBotRow(row as Record<string, unknown>)).length;
-    list = list.filter((row) => !isBotRow(row as Record<string, unknown>));
+    /**
+     * Con ruteo humano (colas): el Inbox excluye las del bot (van a la pestaña Bot).
+     * Sin ruteo (tenant bot-céntrico como El Papu): NO excluir; el Inbox muestra todas,
+     * si no quedaría vacío porque prácticamente todo está en flujo bot.
+     */
+    if (tenantUsesHumanRouting) {
+      list = list.filter((row) => !isBotRow(row as Record<string, unknown>));
+    } else {
+      botLikeCount = 0;
+    }
   } else if (vista === "bot") {
     list = list.filter((row) => isBotRow(row as Record<string, unknown>));
     botLikeCount = list.length;
@@ -1037,7 +1062,7 @@ async function fetchChatConversationsUnsafe(
         .filter((x): x is string => Boolean(x && x.length > 0))
     ),
   ];
-  let byId: Record<string, Record<string, unknown>> = {};
+  const byId: Record<string, Record<string, unknown>> = {};
   if (contactIds.length > 0) {
     const cchunk = 80;
     for (let i = 0; i < contactIds.length; i += cchunk) {
