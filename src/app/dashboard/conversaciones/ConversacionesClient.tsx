@@ -889,6 +889,28 @@ export function ConversacionesClient({
     [searchParams, router, pathname, mode]
   );
 
+  /** Búsqueda: estado visible ("Buscando…") apenas el usuario tipea ≥3 caracteres o mientras carga. */
+  const hasSearchTerm = listSearch.trim().length >= 3;
+  const isSearchPending = hasSearchTerm && (searchLoading || listSearch.trim() !== debouncedSearch);
+
+  /** Botón "Buscar": dispara la búsqueda ya (sin esperar el debounce); reintenta si el término no cambió. */
+  const runSearchNow = useCallback(() => {
+    const eff = listSearch.trim().length >= 3 ? listSearch.trim() : "";
+    if (eff !== debouncedSearch) {
+      setDebouncedSearch(eff);
+    } else {
+      setSearchLoading(true);
+      void loadConversationsRef.current?.({ silent: true }).finally(() => setSearchLoading(false));
+    }
+  }, [listSearch, debouncedSearch]);
+
+  /**
+   * Filtros de ruteo (Canal/Cola/Asignación): sólo tienen sentido si el cliente usa omnicanal.
+   * Con un único canal y sin colas activas (p. ej. este cliente) se ocultan para simplificar la vista.
+   * No afecta la query ni el flujo de sorteo: sin filtros seleccionados se listan todas las del alcance.
+   */
+  const showRoutingFilters = inboxChannels.length > 1 || opsQueues.some((q) => q.is_active);
+
   useEffect(() => {
     const cola = searchParams?.get("cola")?.trim() ?? "";
     if (!cola || opsQueues.length === 0) return;
@@ -2396,31 +2418,79 @@ export function ConversacionesClient({
               </button>
             ) : null}
           </div>
-          <input
-            type="search"
-            value={listSearch}
-            onChange={(e) => setListSearch(e.target.value)}
-            placeholder="Buscar por nombre o número"
-            className="flex-1 min-w-[12rem] border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 bg-white placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-[#4FAEB2]/20 focus:border-[#4FAEB2]"
-            aria-label="Buscar por nombre o número"
-          />
+          <div className="flex items-stretch gap-2 flex-1 min-w-[12rem]">
+            <input
+              type="search"
+              value={listSearch}
+              onChange={(e) => setListSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  runSearchNow();
+                }
+              }}
+              placeholder="Buscar por nombre o número"
+              className="flex-1 min-w-0 border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 bg-white placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-[#4FAEB2]/20 focus:border-[#4FAEB2]"
+              aria-label="Buscar por nombre o número"
+            />
+            <button
+              type="button"
+              onClick={runSearchNow}
+              disabled={isSearchPending}
+              className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white bg-[#4FAEB2] hover:bg-[#3F8E91] disabled:opacity-70 disabled:cursor-not-allowed transition-colors"
+              aria-label="Buscar"
+            >
+              {isSearchPending ? (
+                <>
+                  <span className="h-3 w-3 rounded-full border-2 border-white/40 border-t-white animate-spin" aria-hidden="true" />
+                  Buscando…
+                </>
+              ) : (
+                "Buscar"
+              )}
+            </button>
+          </div>
         </div>
       ) : null}
 
       {mode === "historial" ? (
         <div className="flex flex-wrap items-stretch gap-2 shrink-0 min-w-0">
-          <input
-            type="search"
-            value={listSearch}
-            onChange={(e) => setListSearch(e.target.value)}
-            placeholder="Buscar por nombre o número"
-            className="flex-1 min-w-[12rem] border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 bg-white placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-[#4FAEB2]/20 focus:border-[#4FAEB2]"
-            aria-label="Buscar en historial"
-          />
+          <div className="flex items-stretch gap-2 flex-1 min-w-[12rem]">
+            <input
+              type="search"
+              value={listSearch}
+              onChange={(e) => setListSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  runSearchNow();
+                }
+              }}
+              placeholder="Buscar por nombre o número"
+              className="flex-1 min-w-0 border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 bg-white placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-[#4FAEB2]/20 focus:border-[#4FAEB2]"
+              aria-label="Buscar en historial"
+            />
+            <button
+              type="button"
+              onClick={runSearchNow}
+              disabled={isSearchPending}
+              className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white bg-[#4FAEB2] hover:bg-[#3F8E91] disabled:opacity-70 disabled:cursor-not-allowed transition-colors"
+              aria-label="Buscar"
+            >
+              {isSearchPending ? (
+                <>
+                  <span className="h-3 w-3 rounded-full border-2 border-white/40 border-t-white animate-spin" aria-hidden="true" />
+                  Buscando…
+                </>
+              ) : (
+                "Buscar"
+              )}
+            </button>
+          </div>
         </div>
       ) : null}
 
-      {(mode === "historial" || vista === "inbox") ? (
+      {(mode === "historial" || vista === "inbox") && showRoutingFilters ? (
         <div className="flex flex-wrap items-end gap-3 shrink-0 rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
           <label className="flex flex-col gap-1.5 min-w-[12rem]">
             <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">
@@ -2560,18 +2630,21 @@ export function ConversacionesClient({
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
             {loadingList ? (
               <div className="p-4 text-xs text-slate-400 text-center animate-pulse">Cargando…</div>
+            ) : isSearchPending ? (
+              <div className="p-4 text-xs text-slate-500 text-center space-y-2">
+                <span
+                  className="mx-auto block h-4 w-4 rounded-full border-2 border-[#4FAEB2]/30 border-t-[#4FAEB2] animate-spin"
+                  aria-hidden="true"
+                />
+                <p className="animate-pulse">Buscando en todas las conversaciones…</p>
+              </div>
             ) : conversations.length === 0 ? (
               <div className="p-4 text-xs text-slate-500 text-center space-y-1">
-                <p>No hay conversaciones aún</p>
+                <p>{hasSearchTerm ? `No encontramos chats con “${listSearch.trim()}”` : "No hay conversaciones aún"}</p>
               </div>
             ) : visibleConversations.length === 0 ? (
               <div className="p-4 text-xs text-slate-500 text-center space-y-1">
-                {searchLoading ||
-                (listSearch.trim().length >= 3 && listSearch.trim() !== debouncedSearch) ? (
-                  <p className="animate-pulse">Buscando en todas las conversaciones…</p>
-                ) : (
-                  <p>Ningún chat coincide con la búsqueda</p>
-                )}
+                <p>Ningún chat coincide con la búsqueda</p>
               </div>
             ) : (
               visibleConversations.map((c) => {

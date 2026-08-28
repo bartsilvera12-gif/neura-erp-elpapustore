@@ -206,8 +206,26 @@ export async function fetchChatConversations(
   vista: ConversacionesVista = "inbox",
   filters?: ChatInboxFilters
 ): Promise<ChatConversationsFetchResult> {
-  /** PostgREST sigue lanzando ante error; tenant_pg puede devolver `transient_list_error` sin tirar la UI. */
-  return fetchChatConversationsUnsafe(vista, filters);
+  /**
+   * La ruta PostgREST lanzaba ante cualquier error (query base con timeout bajo carga, RPC ausente,
+   * alcance omnicanal, etc.). En un tenant con decenas de miles de conversaciones open/pending
+   * (p. ej. elpapustore), ese throw crasheaba la lista del inbox con el error genérico de
+   * "Server Components render" en producción. Igualamos el comportamiento de la ruta `tenant_pg`:
+   * degradamos suave a `transient_list_error` para que el cliente conserve la vista previa y muestre
+   * un aviso en lugar de romperse. El error real queda logueado para diagnóstico.
+   */
+  try {
+    return await fetchChatConversationsUnsafe(vista, filters);
+  } catch (e) {
+    console.error("[fetchChatConversations] fallo no controlado; degradando a transient_list_error", {
+      vista,
+      assignment: filters?.assignment ?? null,
+      has_search: Boolean(filters?.search?.trim()),
+      error: e instanceof Error ? e.message : String(e),
+      stack: e instanceof Error ? e.stack?.split("\n").slice(0, 4).join(" | ") : undefined,
+    });
+    return { conversations: [], base_row_count: 0, transient_list_error: true };
+  }
 }
 
 type BotTabClassifyCtx = {
