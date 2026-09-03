@@ -183,8 +183,36 @@ export async function POST(req: Request) {
         .select("modulo_id")
         .eq("empresa_id", empresaId)
         .eq("activo", true);
-      if (emActivos && emActivos.length > 0) {
-        const umRows = emActivos.map((r) => ({
+
+      /**
+       * Antes se asignaban TODOS los módulos activos de la empresa a cualquier usuario no-admin,
+       * así que un usuario nacía viendo el ERP entero y había que recortarlo después. Ahora, si
+       * el alta manda `modulo_ids`, se otorgan solo esos (intersecados con los de la empresa,
+       * para que el body no pueda pedir un módulo que la empresa no tiene). Sin `modulo_ids` se
+       * mantiene el comportamiento anterior, para no romper las altas existentes.
+       */
+      const empresaIds = new Set(
+        (emActivos ?? []).map((r) => String(r.modulo_id ?? "")).filter(Boolean)
+      );
+      const rawModuloIds: unknown = (body as { modulo_ids?: unknown }).modulo_ids;
+      const pedidos: string[] | null = Array.isArray(rawModuloIds)
+        ? [...new Set(rawModuloIds.map((x) => String(x ?? "")).filter((v) => v.length > 0))]
+        : null;
+      const seleccion =
+        pedidos !== null
+          ? pedidos.filter((id) => empresaIds.has(id)).map((id) => ({ modulo_id: id }))
+          : (emActivos ?? []);
+
+      if (pedidos !== null && seleccion.length === 0) {
+        return NextResponse.json(
+          { error: "Ninguno de los módulos indicados está habilitado para la empresa." },
+          { status: 400 }
+        );
+      }
+
+      const emSeleccion = seleccion;
+      if (emSeleccion && emSeleccion.length > 0) {
+        const umRows = emSeleccion.map((r) => ({
           usuario_id: targetId,
           modulo_id: r.modulo_id as string,
         }));

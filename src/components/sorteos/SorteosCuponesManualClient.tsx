@@ -48,15 +48,28 @@ export default function SorteosCuponesManualClient() {
     (async () => {
       setLoadErr(null);
       try {
-        const res = await fetchWithSupabaseSession("/api/sorteos", { cache: "no-store" });
+        /**
+         * Endpoint acotado (id + nombre, solo activos). No usa `/api/sorteos`, que devuelve la
+         * fila entera con boletos vendidos y monto acumulado: un operador de cupón manual no
+         * tiene por qué recibir eso, ni siquiera en el JSON.
+         */
+        const res = await fetchWithSupabaseSession("/api/sorteos/manual-options", {
+          cache: "no-store",
+        });
         const json = (await res.json()) as { success?: boolean; data?: SorteoListItem[] };
         if (!res.ok || !json.success || !Array.isArray(json.data)) {
           setLoadErr("No se pudieron cargar los sorteos.");
           return;
         }
         if (!cancelled) {
-          const activos = json.data.filter((s) => (s.estado ?? "activo") === "activo");
-          setSorteos(activos.length > 0 ? activos : json.data);
+          /**
+           * Sin fallback a "todos": listar un sorteo finalizado dejaba tipear el formulario
+           * entero para que la transacción lo rechazara al guardar.
+           */
+          setSorteos(json.data);
+          if (json.data.length === 0) {
+            setLoadErr("No hay ningún sorteo activo. Pedile a un administrador que active uno.");
+          }
         }
       } catch {
         if (!cancelled) setLoadErr("Error de red al cargar sorteos.");
@@ -231,7 +244,6 @@ export default function SorteosCuponesManualClient() {
             {sorteos.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.nombre}
-                {(s.estado ?? "") !== "activo" ? ` (${s.estado})` : ""}
               </option>
             ))}
           </select>

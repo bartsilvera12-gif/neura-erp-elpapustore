@@ -15,6 +15,7 @@ import {
   flowDataStubFromEntrada,
 } from "@/lib/sorteos/sorteo-ticket-admin";
 import { maybeGenerateAndSendSorteoTicketDelivery } from "@/lib/sorteos/sorteo-ticket-delivery";
+import { requireAnyModuleSlug } from "@/lib/middleware/module-guard";
 
 function isUuid(s: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s.trim());
@@ -39,6 +40,15 @@ export type ManualSaleBody = {
  */
 export async function POST(request: NextRequest) {
   try {
+    /**
+     * Antes bastaba con estar logueado en la empresa: cualquier usuario podía registrar una
+     * venta por HTTP. Ahora exige el módulo del cupón manual (un admin con `sorteos` pasa por alias).
+     */
+    const guard = await requireAnyModuleSlug(request, ["cupon_manual"]);
+    if (!guard.ok) {
+      return NextResponse.json(errorResponse(guard.message), { status: guard.status });
+    }
+
     const ctx = await getTenantSupabaseFromAuth(request);
     if (!ctx) {
       return NextResponse.json(errorResponse(API_ERRORS.UNAUTHORIZED), { status: 401 });

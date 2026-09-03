@@ -7,12 +7,22 @@ import { fetchDataSchemaForEmpresaId } from "@/lib/supabase/empresa-data-schema"
 import { getChatPostgresPool } from "@/lib/supabase/chat-pg-pool";
 import { isLikelyUnexposedTenantChatSchema } from "@/lib/supabase/chat-data-schema";
 import { mergeCouponNumberingFromUnknown } from "@/lib/sorteos/coupon-numbering-api";
+import { requireAnyModuleSlug } from "@/lib/middleware/module-guard";
 
 /**
  * GET /api/sorteos — lista sorteos del tenant (Postgres shim si schema no expuesto).
  */
 export async function GET(request: NextRequest) {
   try {
+    /**
+     * Exige el módulo `sorteos`, no solo sesión: la fila completa incluye
+     * `total_boletos_vendidos`, `max_boletos` y `ultimo_numero_cupon`. Quien solo tiene
+     * `cupon_manual` usa `/api/sorteos/manual-options`, que devuelve id + nombre.
+     */
+    const guard = await requireAnyModuleSlug(request, ["sorteos"]);
+    if (!guard.ok) {
+      return NextResponse.json(errorResponse(guard.message), { status: guard.status });
+    }
     const ctx = await getTenantSupabaseFromAuth(request);
     if (!ctx) {
       return NextResponse.json(errorResponse(API_ERRORS.UNAUTHORIZED), { status: 401 });
