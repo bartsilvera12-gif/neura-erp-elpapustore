@@ -1,5 +1,5 @@
--- PASO 0 (correr solo esto primero): confirmar las columnas obligatorias de `modulos`.
--- Si aparece alguna NOT NULL sin default además de nombre/slug, avisame antes de seguir.
+-- PASO 0 — YA VERIFICADO (2026-09-03): `modulos` = id, created_at (con default) + nombre,
+-- descripcion, slug (nullable). El INSERT de abajo cubre todo lo necesario.
 --   SELECT column_name, is_nullable, column_default
 --   FROM information_schema.columns
 --   WHERE table_schema = 'elpapustore_erp' AND table_name = 'modulos'
@@ -49,8 +49,9 @@ BEGIN
 
   IF v_modulo_id IS NULL THEN
     EXECUTE format(
-      'INSERT INTO %I.modulos (nombre, slug) VALUES ($1, $2) RETURNING id', v_schema
-    ) INTO v_modulo_id USING 'Cupón manual', 'cupon_manual';
+      'INSERT INTO %I.modulos (nombre, slug, descripcion) VALUES ($1, $2, $3) RETURNING id', v_schema
+    ) INTO v_modulo_id
+      USING 'Cupón manual', 'cupon_manual', 'Carga de ventas presenciales (efectivo) sin acceso al resto de Sorteos';
     RAISE NOTICE 'Módulo cupon_manual creado: %', v_modulo_id;
   ELSE
     RAISE NOTICE 'Módulo cupon_manual ya existía: %', v_modulo_id;
