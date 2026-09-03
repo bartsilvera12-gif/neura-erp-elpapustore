@@ -56,7 +56,8 @@
     "qa:chat-flow-node-fks": "node scripts/qa-chat-flow-node-fks-tenants.cjs",
     "db:apply-provision-chat-flow-node-fks": "node scripts/apply-migration-file-pg.cjs supabase/migrations/20260531100000_provision_fix_chat_flow_node_fks_one_schema.sql",
     "db:apply-sorteo-identity-recall": "tsx scripts/apply-sorteo-identity-recall-node.ts",
-    "qa:sorteo-identity-recall": "tsx --conditions react-server scripts/qa-sorteo-identity-recall-unit.ts"
+    "qa:sorteo-identity-recall": "tsx --conditions react-server scripts/qa-sorteo-identity-recall-unit.ts",
+    "qa:purchase-intent-labels": "tsx --conditions react-server scripts/qa-purchase-intent-labels-unit.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

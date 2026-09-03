@@ -427,6 +427,18 @@ function interactiveReplyMatchesPurchaseIntent(rawPayload: Record<string, unknow
   return matchesPurchaseIntent(whatsappInteractiveReplyTitle(rawPayload));
 }
 
+/**
+ * `wa_message_id` del mensaje entrante de Meta. Viene dentro del payload crudo (`msg.id`),
+ * así que no hace falta cambiar la firma de processInteractiveReply.
+ */
+function waMessageIdFromRawPayload(rawPayload: Record<string, unknown>): string {
+  const raw = rawPayload?.id;
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+/** Evento marcador: deja constancia de que este mensaje ya pasó por el motor de flujo. */
+const INTERACTIVE_PROCESSED_EVENT = "interactive_reply_processed" as const;
+
 export function createFlowEngine(ctx: FlowEngineContext) {
   const supabase = ctx.supabase;
 
@@ -2244,6 +2256,66 @@ export function createFlowEngine(ctx: FlowEngineContext) {
     return { ok: true, nodeCode: node.node_code };
   }
 
+  /**
+   * ¿Este `wa_message_id` ya pasó por el motor? (reintentos de webhook de Meta)
+   *
+   * Mismo patrón que `flowImageInboundAlreadyRecorded` en whatsapp-webhook-service, que ya
+   * protegía las imágenes de comprobante. Los clics de botón no lo tenían: el webhook los
+   * exceptúa a propósito del dedupe general para poder re-correr el routing de campañas
+   * (`mustRetryInboundRoutingDespiteDedupe`), pero esa excepción arrastraba también al motor
+   * de flujo. Consecuencia medida en producción: un "Confirmado" reintentado 5 veces por Meta
+   * intentó cerrar la compra 5 veces y mandó 5 avisos de error al cliente; y un botón de combo
+   * reprocesado despues de que el nodo avanzara caia en invalid_button -> intencion de compra
+   * -> reinicio de la compra desde cero.
+   *
+   * Un re-toque real del cliente trae un `wa_message_id` NUEVO, así que esto solo suprime los
+   * reintentos automáticos de Meta: nadie queda trabado por no poder volver a tocar.
+   */
+  async function interactiveReplyAlreadyProcessed(
+    conversationId: string,
+    waMessageId: string
+  ): Promise<boolean> {
+    if (!waMessageId) return false;
+    const { data, error } = await supabase
+      .from("chat_flow_events")
+      .select("payload")
+      .eq("conversation_id", conversationId)
+      .eq("event_type", INTERACTIVE_PROCESSED_EVENT)
+      .order("created_at", { ascending: false })
+      .limit(25);
+    if (error || !data?.length) return false;
+    return data.some((r) => {
+      const p = (r as { payload?: Record<string, unknown> | null }).payload;
+      return typeof p?.wa_message_id === "string" && p.wa_message_id === waMessageId;
+    });
+  }
+
+  /**
+   * ¿Este botón ya se eligió antes en ESTA misma sesión de compra?
+   *
+   * Si es así, no puede expresar "quiero comprar de nuevo": es un eco o un toque tardío sobre un
+   * mensaje que quedó arriba en la conversación. Red de seguridad por si algún duplicado escapa
+   * al dedupe por wa_message_id. No afecta al "Comprar mas" del cierre, que nunca fue elegido
+   * antes dentro de la sesión en curso.
+   */
+  async function buttonAlreadySelectedInSession(
+    flowSessionId: string | null | undefined,
+    metaButtonId: string
+  ): Promise<boolean> {
+    const sid = flowSessionId?.trim();
+    const btn = metaButtonId.trim();
+    if (!sid || !btn) return false;
+    const { data, error } = await supabase
+      .from("chat_flow_events")
+      .select("id")
+      .eq("flow_session_id", sid)
+      .eq("event_type", "button_selected")
+      .eq("meta_button_id", btn)
+      .limit(1);
+    if (error) return false;
+    return (data?.length ?? 0) > 0;
+  }
+
   async function processInteractiveReply(
     params: ProcessInteractiveReplyParams
   ): Promise<{ ok: boolean; status: string; nextNodeCode?: string; error?: string }> {
@@ -2252,6 +2324,16 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       empresaId: params.empresaId,
       metaButtonId: params.metaButtonId,
     });
+
+    const waMessageIdInteractive = waMessageIdFromRawPayload(params.rawPayload);
+    if (await interactiveReplyAlreadyProcessed(params.conversationId, waMessageIdInteractive)) {
+      console.info("[flow-engine] duplicate interactive ignored", {
+        conversationId: params.conversationId,
+        metaButtonId: params.metaButtonId,
+        wa_message_id: waMessageIdInteractive,
+      });
+      return { ok: true, status: "duplicate_interactive_ignored" };
+    }
     const state = await getConversationFlowState(params.conversationId);
     if (!state || state.empresa_id !== params.empresaId) {
       return { ok: false, status: "conversation_not_found", error: "Conversación no encontrada" };
@@ -2268,6 +2350,24 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         payload: { reason: "conversation_not_in_bot_mode", raw: params.rawPayload },
       });
       return { ok: true, status: "ignored_not_bot_mode" };
+    }
+
+    /**
+     * Marca antes de tocar nada: si Meta reintenta este mismo mensaje, el guard del inicio lo corta.
+     * Se registra aunque el botón termine siendo inválido — un reintento de un botón inválido
+     * tampoco debe re-ejecutarse.
+     */
+    if (waMessageIdInteractive) {
+      await insertFlowEvent({
+        empresaId: state.empresa_id,
+        conversationId: state.id,
+        flowCode: state.flow_code,
+        nodeCode: state.flow_current_node,
+        flowSessionId: state.active_flow_session_id,
+        eventType: INTERACTIVE_PROCESSED_EVENT,
+        metaButtonId: params.metaButtonId,
+        payload: { wa_message_id: waMessageIdInteractive },
+      });
     }
     if (!state.flow_code || !state.flow_current_node) {
       await insertFlowEvent({
@@ -2387,7 +2487,17 @@ export function createFlowEngine(ctx: FlowEngineContext) {
     const options = await getNodeOptions(currentNode.id);
     const selected = resolveSelectedFlowOption(options, params.metaButtonId, params.rawPayload);
     if (!selected) {
-      const purchaseIntent = interactiveReplyMatchesPurchaseIntent(params.rawPayload);
+      /**
+       * Un botón ya elegido en esta sesión es un eco o un toque tardío sobre un mensaje viejo,
+       * no una intención de comprar otra vez. Sin esto, cualquier combo re-tocado ("2 boletas
+       * por 20.000") matchea la raíz `bolet` y reinicia la compra desde cero.
+       */
+      const alreadyUsedInSession = await buttonAlreadySelectedInSession(
+        state.active_flow_session_id,
+        params.metaButtonId
+      );
+      const purchaseIntent =
+        !alreadyUsedInSession && interactiveReplyMatchesPurchaseIntent(params.rawPayload);
       await insertFlowEvent({
         empresaId: state.empresa_id,
         conversationId: state.id,
@@ -2399,6 +2509,8 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         payload: {
           reason: "option_not_found_in_node",
           purchase_intent: purchaseIntent,
+          already_used_in_session: alreadyUsedInSession,
+          wa_message_id: waMessageIdInteractive || null,
           raw: params.rawPayload,
         },
       });
