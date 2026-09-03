@@ -60,6 +60,20 @@ import {
   shouldSuppressSorteoFinalTextAfterImageOnlyTicket,
 } from "@/lib/sorteos/sorteo-ticket-delivery";
 import { readSorteoCantidadNumericFromMap } from "@/lib/sorteos/sorteo-cantidad-fields";
+import {
+  IDENTITY_RECALL_NODE_TYPE,
+  IDENTITY_RECALL_CLEAR_FIELDS,
+  IDENTITY_RECALL_SNAPSHOT_FIELD,
+  IDENTITY_RECALL_CONFIRMED_FIELD,
+  buildIdentityRecallFlowDataWrites,
+  buildIdentityRecallSnapshotWrites,
+  buildIdentityRecallVars,
+  optionPayloadRequestsNewIdentity,
+  optionPayloadUsesRegisteredIdentity,
+  identityRecallWasConfirmed,
+  readIdentityRecallSnapshot,
+} from "@/lib/sorteos/sorteo-identity-recall";
+import { fetchIdentityRecallCliente } from "@/lib/sorteos/sorteo-identity-recall-lookup";
 import { SORTEO_TICKET_DEFAULT_STUB, type SorteoTicketDeliveryMode } from "@/lib/sorteos/sorteo-ticket-types";
 import { isSorteoFinalTicketNode } from "@/lib/chat/sorteo-final-ticket-node";
 import { matchesPurchaseIntent } from "@/lib/chat/purchase-intent";
@@ -70,6 +84,7 @@ import {
 import { fetchDataSchemaForEmpresaId } from "@/lib/supabase/empresa-data-schema";
 import {
   describeFlowCaptureCompletenessForLogs,
+  flowDataHasValueForCaptureSaveField,
   isIdentityCaptureField,
   resolveEffectiveNodeCodeForFlowCompleteness,
 } from "@/lib/sorteos/sorteo-flow-capture-order";
@@ -161,7 +176,7 @@ type FlowNode = {
   message_text: string | null;
   save_as_field: string | null;
   next_node_code: string | null;
-  node_type: "buttons" | "list" | "text" | "media" | "image_input" | "human" | "end";
+  node_type: "buttons" | "list" | "text" | "media" | "image_input" | "human" | "end" | "identity_recall";
   is_active: boolean;
 };
 
@@ -1655,8 +1670,8 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       };
     }
 
-    const node = await getNode(state.empresa_id, state.flow_code, state.flow_current_node);
-    if (!node) return { ok: false, error: "Nodo actual no encontrado" };
+    const nodeFetched = await getNode(state.empresa_id, state.flow_code, state.flow_current_node);
+    if (!nodeFetched) return { ok: false, error: "Nodo actual no encontrado" };
 
     const sidGate = state.active_flow_session_id.trim();
     const hydFdPointer = await buildHydratedFlowDataForCompletenessGate({
@@ -1715,6 +1730,137 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       return sendCurrentFlowNode({ ...params, __autoHop: currentHop });
     }
 
+    /**
+     * Recompra rápida (`identity_recall`): si el teléfono ya tiene cliente registrado, el nodo se
+     * envía como botones con los datos interpolados. Si NO lo tiene —comprador nuevo, o la
+     * consulta falló— se saltea sin mandar nada y el flujo sigue pidiendo los datos como siempre.
+     *
+     * El salteo reusa la misma mecánica que el ajuste de puntero de completitud: avanzar y
+     * re-entrar a sendCurrentFlowNode, que ya tiene tope de auto-encadenamiento (__autoHop).
+     */
+    let identityRecallVars: Record<string, string> = {};
+    if (nodeFetched.node_type === IDENTITY_RECALL_NODE_TYPE) {
+      const recallCliente = await fetchIdentityRecallCliente(
+        supabase,
+        state.empresa_id,
+        ctxSend.toDigits
+      );
+
+      if (!recallCliente) {
+        const nextRecall = nodeFetched.next_node_code?.trim() ?? "";
+        await insertFlowEvent({
+          empresaId: state.empresa_id,
+          conversationId: state.id,
+          flowCode: state.flow_code,
+          nodeCode: nodeFetched.node_code,
+          flowSessionId: sidGate,
+          eventType: "identity_recall_skipped",
+          payload: {
+            reason: "cliente_no_registrado",
+            next_node_code: nextRecall || null,
+          },
+        });
+        if (!nextRecall) {
+          /** Nodo de recall sin salida: no hay nada que enviar ni a dónde ir. */
+          return { ok: false, error: "El paso de recompra no tiene nodo siguiente configurado" };
+        }
+        const advRecall = await advanceConversationToNode({
+          conversationId: state.id,
+          empresaId: state.empresa_id,
+          flowCode: state.flow_code,
+          nextNodeCode: nextRecall,
+        });
+        if (!advRecall.ok) return { ok: false, error: advRecall.error ?? "advance_failed" };
+        return sendCurrentFlowNode({ ...params, __autoHop: currentHop + 1 });
+      }
+
+      identityRecallVars = buildIdentityRecallVars(recallCliente);
+
+      /** Snapshot de lo mostrado: el "Sí" promueve esto, no una relectura de `clientes`. */
+      const snapRows = buildIdentityRecallSnapshotWrites(recallCliente).map((r) => ({
+        empresa_id: state.empresa_id,
+        conversation_id: state.id,
+        flow_code: state.flow_code as string,
+        flow_session_id: sidGate,
+        field_name: r.field_name,
+        field_value: r.field_value,
+      }));
+      const { error: snapErr } = await supabase
+        .from("chat_flow_data")
+        .upsert(snapRows, { onConflict: "flow_session_id,field_name" });
+      if (snapErr) {
+        console.warn(FLOW_SORTEO_LOG, "identity_recall_snapshot_failed", {
+          conversation_id: state.id,
+          message: snapErr.message,
+        });
+        return { ok: false, error: "No se pudo preparar el paso de recompra" };
+      }
+
+      await insertFlowEvent({
+        empresaId: state.empresa_id,
+        conversationId: state.id,
+        flowCode: state.flow_code,
+        nodeCode: nodeFetched.node_code,
+        flowSessionId: sidGate,
+        eventType: "identity_recall_offered",
+        payload: { cliente_id: recallCliente.clienteId },
+      });
+    }
+
+    /**
+     * Tras confirmar "usar mis datos registrados", los pasos de captura de identidad ya tienen
+     * valor: preguntarlos de nuevo anularía el ahorro que busca la recompra rápida. Se saltean.
+     *
+     * Deliberadamente angosto — sólo con las TRES condiciones a la vez:
+     *   1. la sesión tiene la marca de confirmación de recall,
+     *   2. el nodo es de captura de texto sobre un campo de IDENTIDAD (mismo clasificador que el
+     *      gate, para no divergir),
+     *   3. ese campo ya tiene valor en la sesión.
+     * Sin la marca no se saltea nada: ninguna compra normal, ningún otro flujo y ningún nodo que
+     * no sea de identidad cambian de comportamiento. El puntero de completitud sigue pudiendo
+     * retroceder si algo faltara.
+     */
+    if (
+      nodeFetched.node_type === "text" &&
+      nodeFetched.save_as_field?.trim() &&
+      isIdentityCaptureField(nodeFetched.save_as_field) &&
+      identityRecallWasConfirmed(hydFdPointer) &&
+      flowDataHasValueForCaptureSaveField(hydFdPointer, nodeFetched.save_as_field)
+    ) {
+      const nextAfterCaptured = nodeFetched.next_node_code?.trim() ?? "";
+      if (nextAfterCaptured) {
+        await insertFlowEvent({
+          empresaId: state.empresa_id,
+          conversationId: state.id,
+          flowCode: state.flow_code,
+          nodeCode: nodeFetched.node_code,
+          flowSessionId: sidGate,
+          eventType: "identity_recall_capture_skipped",
+          payload: {
+            save_as_field: nodeFetched.save_as_field,
+            next_node_code: nextAfterCaptured,
+          },
+        });
+        const advSkip = await advanceConversationToNode({
+          conversationId: state.id,
+          empresaId: state.empresa_id,
+          flowCode: state.flow_code,
+          nextNodeCode: nextAfterCaptured,
+        });
+        if (!advSkip.ok) return { ok: false, error: advSkip.error ?? "advance_failed" };
+        return sendCurrentFlowNode({ ...params, __autoHop: currentHop + 1 });
+      }
+    }
+
+    /**
+     * Desde acá el nodo de recall se comporta como uno de botones: mismo render, mismos límites
+     * de Meta, misma resolución de opciones. Evita duplicar las ramas de envío.
+     */
+    const node =
+      nodeFetched.node_type === IDENTITY_RECALL_NODE_TYPE
+        ? { ...nodeFetched, node_type: "buttons" as const }
+        : nodeFetched;
+
     const flowVarsBase = await getConversationFlowDataMap({
       empresaId: state.empresa_id,
       conversationId: state.id,
@@ -1722,7 +1868,11 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       flowSessionId: state.active_flow_session_id,
       traceReadContext: "send_current_node_confirmacion_resumen",
     });
-    const flowVars = { ...flowVarsBase, ...(params.mergeFlowVars ?? {}) };
+    const flowVars = {
+      ...flowVarsBase,
+      ...identityRecallVars,
+      ...(params.mergeFlowVars ?? {}),
+    };
     const sumV = summarizeFlowDataForTrace(flowVars);
     flowTrace("send_node_interpolate", {
       conversation_id: state.id,
@@ -2392,6 +2542,91 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         option_value: selected.option_value,
         option_payload: selected.option_payload,
       });
+    }
+
+    /**
+     * Recompra rápida: el botón elegido en el nodo `identity_recall` define qué pasa con la
+     * identidad del comprador.
+     *
+     * - "Sí, confirmar" → promueve el snapshot mostrado a las claves canónicas de la sesión
+     *   ACTUAL. Queda idéntico a que la persona hubiera tipeado los datos, así que el resto del
+     *   flujo (gate de completitud, creación de orden, ticket) no necesita saber que hubo recall.
+     * - "No, ingresar nuevo" → vacía TODOS los alias de identidad. Es una acción positiva y no
+     *   una omisión: si sobrevive un valor en cualquier alias, el gate lo toma como identidad
+     *   cargada y crea la orden con los datos de la compra anterior — el bug de 2388584.
+     *
+     * Se escribe vía `payloadEntries` para reusar el upsert por `(flow_session_id, field_name)`
+     * que ya corre unas líneas más abajo.
+     */
+    if (currentNode.node_type === IDENTITY_RECALL_NODE_TYPE) {
+      const usarRegistrados = optionPayloadUsesRegisteredIdentity(selected.option_payload);
+      const cargarNuevos = optionPayloadRequestsNewIdentity(selected.option_payload);
+
+      if (usarRegistrados && flowSidInteractive) {
+        const { data: snapRow, error: snapReadErr } = await supabase
+          .from("chat_flow_data")
+          .select("field_value")
+          .eq("empresa_id", state.empresa_id)
+          .eq("flow_session_id", flowSidInteractive)
+          .eq("field_name", IDENTITY_RECALL_SNAPSHOT_FIELD)
+          .maybeSingle();
+        const snap = snapReadErr
+          ? null
+          : readIdentityRecallSnapshot(
+              (snapRow as { field_value?: string } | null)?.field_value
+            );
+
+        if (snap) {
+          for (const w of buildIdentityRecallFlowDataWrites(snap)) {
+            payloadEntries.push([w.field_name, w.field_value]);
+          }
+          /** Consumido: que no quede para promoverse de nuevo en otra compra. */
+          payloadEntries.push([IDENTITY_RECALL_SNAPSHOT_FIELD, ""]);
+          /** Habilita saltear los pasos de captura de identidad que quedaron llenos. */
+          payloadEntries.push([IDENTITY_RECALL_CONFIRMED_FIELD, "si"]);
+        } else {
+          /**
+           * Sin snapshot legible no inventamos identidad: dejamos los slots como están y el
+           * flujo vuelve a pedir los datos. Preferimos un paso extra antes que una orden a
+           * nombre equivocado.
+           */
+          console.warn(FLOW_SORTEO_LOG, "identity_recall_confirm_without_snapshot", {
+            conversation_id: state.id,
+            flow_session_id: flowSidInteractive,
+            read_error: snapReadErr?.message ?? null,
+          });
+        }
+
+        await insertFlowEvent({
+          empresaId: state.empresa_id,
+          conversationId: state.id,
+          flowCode: state.flow_code,
+          nodeCode: currentNode.node_code,
+          flowSessionId: flowSidInteractive,
+          eventType: "identity_recall_confirmed",
+          metaButtonId: params.metaButtonId,
+          selectedOptionId: selected.id,
+          payload: {
+            promoted: Boolean(snap),
+            cliente_id: snap?.clienteId ?? null,
+          },
+        });
+      } else if (cargarNuevos) {
+        for (const field of IDENTITY_RECALL_CLEAR_FIELDS) {
+          payloadEntries.push([field, ""]);
+        }
+        await insertFlowEvent({
+          empresaId: state.empresa_id,
+          conversationId: state.id,
+          flowCode: state.flow_code,
+          nodeCode: currentNode.node_code,
+          flowSessionId: flowSidInteractive,
+          eventType: "identity_recall_rejected",
+          metaButtonId: params.metaButtonId,
+          selectedOptionId: selected.id,
+          payload: { cleared_fields: IDENTITY_RECALL_CLEAR_FIELDS.length },
+        });
+      }
     }
 
     if (payloadEntries.length > 0 && state.flow_code) {

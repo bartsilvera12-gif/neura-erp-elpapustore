@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getChatServiceClientForEmpresa } from "@/app/api/chat/_chat-service-client";
 import { getAuthWithRol } from "@/lib/middleware/auth";
 
-const VALID_NODE_TYPES = ["buttons", "list", "text", "media", "image_input", "human", "end"] as const;
+const VALID_NODE_TYPES = ["buttons", "list", "text", "media", "image_input", "human", "end", "identity_recall"] as const;
 
 export async function GET(
   request: NextRequest,
