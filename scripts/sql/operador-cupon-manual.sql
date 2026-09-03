@@ -21,21 +21,17 @@
 
 DO $$
 DECLARE
-  ------------------------------------------------------------------ EDITAR ESTOS 4 VALORES
+  -------------------------------------------------- Valores del usuario ya creado en Supabase Auth
   v_schema      text := 'elpapustore_erp';
-  v_auth_uuid   uuid := '00000000-0000-0000-0000-000000000000';  -- UUID de Supabase Auth
-  v_email       text := 'operador@elpapustore.com';               -- el mismo email del usuario
+  v_auth_uuid   uuid := '58a148dc-e0cf-47cc-b31e-4bf5b4dde1ee';
+  v_email       text := 'elpapustore@usuario.com';
   v_nombre      text := 'Operador Cupón Manual';
-  --------------------------------------------------------------------------------------------
+  ----------------------------------------------------------------------------------------------
 
   v_empresa_id  uuid;
   v_modulo_id   uuid;
   v_usuario_id  uuid;
 BEGIN
-  IF v_auth_uuid = '00000000-0000-0000-0000-000000000000'::uuid THEN
-    RAISE EXCEPTION 'Falta reemplazar v_auth_uuid por el UUID real del usuario';
-  END IF;
-
   -- Empresa del tenant. En una instancia dedicada hay una sola.
   EXECUTE format('SELECT id FROM %I.empresas ORDER BY created_at LIMIT 1', v_schema)
     INTO v_empresa_id;
@@ -111,4 +107,4 @@ SELECT u.email, u.rol, u.estado, m.slug AS modulo
 FROM elpapustore_erp.usuarios u
 JOIN elpapustore_erp.usuario_modulos um ON um.usuario_id = u.id
 JOIN elpapustore_erp.modulos m ON m.id = um.modulo_id
-WHERE lower(u.email) = lower('operador@elpapustore.com');
+WHERE lower(u.email) = lower('elpapustore@usuario.com');
