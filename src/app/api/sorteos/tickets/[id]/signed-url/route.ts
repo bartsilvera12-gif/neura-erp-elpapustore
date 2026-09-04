@@ -4,12 +4,22 @@ import { getTenantSupabaseFromAuth } from "@/lib/supabase/tenant-api";
 import { successResponse, errorResponse } from "@/lib/api/response";
 import { API_ERRORS } from "@/lib/api/errors";
 import { createSignedUrlForTicket } from "@/lib/sorteos/sorteo-ticket-storage";
+import { requireAnyModuleSlug } from "@/lib/middleware/module-guard";
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    /**
+     * El operador de cupón manual necesita abrir el ticket que acaba de generar para mostrárselo
+     * al cliente. Con `cupon_manual` alcanza; los admins pasan por el alias de `sorteos`.
+     */
+    const guard = await requireAnyModuleSlug(request, ["cupon_manual"]);
+    if (!guard.ok) {
+      return NextResponse.json(errorResponse(guard.message), { status: guard.status });
+    }
+
     const ctx = await getTenantSupabaseFromAuth(request);
     if (!ctx) {
       return NextResponse.json(errorResponse(API_ERRORS.UNAUTHORIZED), { status: 401 });

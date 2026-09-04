@@ -38,6 +38,15 @@ export default function SorteosCuponesManualClient() {
   });
   const [submitErr, setSubmitErr] = useState<string | null>(null);
   const [submitOk, setSubmitOk] = useState<string | null>(null);
+  /**
+   * La respuesta ya traía `cupones` y `ticket.delivery_id`, pero la pantalla solo mostraba el
+   * número de orden. El operador acotado al cupón manual no tiene el módulo Sorteos, así que no
+   * podía ver por ningún lado los números que le acababa de vender al cliente parado enfrente.
+   */
+  const [okCupones, setOkCupones] = useState<string[]>([]);
+  const [okDeliveryId, setOkDeliveryId] = useState<string | null>(null);
+  const [ticketBusy, setTicketBusy] = useState(false);
+  const [ticketErr, setTicketErr] = useState<string | null>(null);
 
   useEffect(() => {
     setIdempotencyKey(crypto.randomUUID());
@@ -92,6 +101,30 @@ export default function SorteosCuponesManualClient() {
     });
   }, [sorteos, sorteoFromUrl]);
 
+  /** Abre el ticket recién generado en una pestaña nueva, para mostrarlo o imprimirlo. */
+  const verTicket = useCallback(async () => {
+    if (!okDeliveryId || ticketBusy) return;
+    setTicketBusy(true);
+    setTicketErr(null);
+    try {
+      const res = await fetchWithSupabaseSession(
+        `/api/sorteos/tickets/${okDeliveryId}/signed-url`,
+        { cache: "no-store" }
+      );
+      const json = (await res.json()) as { success?: boolean; data?: { url?: string }; error?: string };
+      const url = json.data?.url;
+      if (!res.ok || !json.success || !url) {
+        setTicketErr(json.error ?? "No se pudo abrir el ticket.");
+        return;
+      }
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch {
+      setTicketErr("Error de red al abrir el ticket.");
+    } finally {
+      setTicketBusy(false);
+    }
+  }, [okDeliveryId, ticketBusy]);
+
   const onField = useCallback(
     (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
       const { name, value, type } = e.target;
@@ -109,6 +142,9 @@ export default function SorteosCuponesManualClient() {
     e.preventDefault();
     setSubmitErr(null);
     setSubmitOk(null);
+    setOkCupones([]);
+    setOkDeliveryId(null);
+    setTicketErr(null);
 
     const cantidad = Math.floor(Number(form.cantidad_boletos));
     const monto = Number(form.monto_total);
@@ -161,7 +197,14 @@ export default function SorteosCuponesManualClient() {
         data?: {
           entrada_id?: string;
           numero_orden?: number;
-          ticket?: { attempted?: boolean; delivery_ok?: boolean; skipped?: boolean; reason?: string };
+          cupones?: Array<{ id?: string; numero_cupon?: string }>;
+          ticket?: {
+            attempted?: boolean;
+            delivery_ok?: boolean;
+            skipped?: boolean;
+            reason?: string;
+            delivery_id?: string;
+          };
         };
         error?: string;
       };
@@ -183,6 +226,13 @@ export default function SorteosCuponesManualClient() {
         }
       }
       setSubmitOk(msg);
+      setOkCupones(
+        (json.data?.cupones ?? [])
+          .map((c) => String(c?.numero_cupon ?? "").trim())
+          .filter((n) => n.length > 0)
+      );
+      setOkDeliveryId(t?.delivery_id?.trim() || null);
+      setTicketErr(null);
       setForm((p) => ({
         ...p,
         nombre: "",
@@ -227,7 +277,29 @@ export default function SorteosCuponesManualClient() {
         ) : null}
         {submitOk ? (
           <div className="rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-900 text-xs">
-            {submitOk}
+            <div>{submitOk}</div>
+
+            {okCupones.length > 0 ? (
+              <div className="mt-2">
+                <span className="font-semibold">
+                  {okCupones.length === 1 ? "Número" : "Números"}:
+                </span>{" "}
+                <span className="font-mono text-sm tracking-wide">{okCupones.join("  ·  ")}</span>
+              </div>
+            ) : null}
+
+            {okDeliveryId ? (
+              <button
+                type="button"
+                onClick={() => void verTicket()}
+                disabled={ticketBusy}
+                className="mt-2 rounded border border-emerald-300 bg-white px-2 py-1 font-medium text-emerald-800 transition-colors hover:bg-emerald-100 disabled:opacity-60"
+              >
+                {ticketBusy ? "Abriendo…" : "Ver ticket"}
+              </button>
+            ) : null}
+
+            {ticketErr ? <div className="mt-1 text-rose-700">{ticketErr}</div> : null}
           </div>
         ) : null}
 
