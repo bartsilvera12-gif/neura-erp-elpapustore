@@ -44,6 +44,7 @@ import {
   finalizeSorteoOrderFromConfirmedFlowData,
   getSorteoDatosIncompletosMessage,
   getSorteoIdForChatFlow,
+  lookupSorteoIdForChatFlow,
   optionPayloadFinalizesSorteoOrder,
   parseSorteoParticipantFromFlowData,
   prepareFlowDataForSorteoOrder,
@@ -4485,7 +4486,12 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         keys: Object.keys(hydFdImg).sort(),
       });
 
-      const sorteoIdPre = await getSorteoIdForChatFlow(supabase, state.empresa_id, state.flow_code as string);
+      const sorteoLookupPre = await lookupSorteoIdForChatFlow(
+        supabase,
+        state.empresa_id,
+        state.flow_code as string
+      );
+      const sorteoIdPre = sorteoLookupPre.kind === "ok" ? sorteoLookupPre.sorteoId : null;
 
       console.info(FLOW_SORTEO_LOG, "[order-create]", "[start]", {
         conversation_id: state.id,
@@ -4511,20 +4517,33 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       };
 
       if (!sorteoIdPre) {
+        /**
+         * Dos causas muy distintas para el cliente:
+         *  - `error`: la consulta no respondió. El vínculo puede estar perfecto. Su plata ya se
+         *    transfirió, así que lo peor es darle la compra por perdida: le pedimos que reenvíe.
+         *  - `none`: de verdad no hay sorteo configurado. Ahí sí hace falta un operador.
+         */
+        const lookupFallo = sorteoLookupPre.kind === "error";
         console.error(FLOW_SORTEO_LOG, "[order-create]", "[missing_sorteo_id]", {
           schema: dataSchemaTag,
           conversation_id: state.id,
           flow_session_id: imgFlowSid,
           flow_code: state.flow_code,
           empresa_id: state.empresa_id,
+          lookup_kind: sorteoLookupPre.kind,
+          lookup_error: lookupFallo ? sorteoLookupPre.message : null,
         });
         await notifySorteoImageErr(
-          "Recibimos tu comprobante, pero este flujo no está vinculado a un sorteo en el sistema. Un operador te va a contactar."
+          lookupFallo
+            ? "Tuvimos un problema técnico al registrar tu compra. Tu comprobante está guardado: reenvialo en un minuto, por favor. Si sigue fallando, un operador te va a contactar."
+            : "Recibimos tu comprobante, pero este flujo no está vinculado a un sorteo en el sistema. Un operador te va a contactar."
         );
         return {
           ok: false,
-          status: "missing_sorteo_id",
-          error: "chat_flows.sorteo_id no configurado para este flujo",
+          status: lookupFallo ? "sorteo_lookup_failed" : "missing_sorteo_id",
+          error: lookupFallo
+            ? `No se pudo consultar chat_flows: ${sorteoLookupPre.message}`
+            : "chat_flows.sorteo_id no configurado para este flujo",
         };
       }
 

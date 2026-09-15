@@ -616,27 +616,92 @@ export function parseSorteoPricingFromFlowData(data: Record<string, string>): {
   return { montoCompra, promoNombre, precioRegularReferencia };
 }
 
+/**
+ * Resultado de buscar el sorteo del flujo, distinguiendo "no hay sorteo configurado" de
+ * "no se pudo preguntar".
+ *
+ * Antes las dos cosas devolvían `null` y el cliente recibía "este flujo no está vinculado a un
+ * sorteo" — incluso cuando el vínculo estaba perfecto y lo que falló fue la consulta. Medido en
+ * producción: 10 compradores entre may y sep-2026 transfirieron y quedaron sin cupón por esto.
+ */
+export type SorteoFlowLookup =
+  | { kind: "ok"; sorteoId: string }
+  | { kind: "none" }
+  | { kind: "error"; message: string };
+
+/** Espera corta entre reintentos (blip de red / base lenta). */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Busca el sorteo del flujo con reintentos ante error.
+ *
+ * El reintento solo corre en el camino que HOY ya falla, así que no cambia el happy path: si la
+ * primera consulta responde, se devuelve igual que antes y no se espera nada.
+ */
+export async function lookupSorteoIdForChatFlow(
+  supabase: AppSupabaseClient,
+  empresaId: string,
+  flowCode: string
+): Promise<SorteoFlowLookup> {
+  const fc = flowCode.trim();
+  if (!fc) return { kind: "none" };
+
+  const backoffMs = [0, 200, 500];
+  let lastError = "";
+
+  for (let attempt = 0; attempt < backoffMs.length; attempt++) {
+    if (backoffMs[attempt]! > 0) await sleepMs(backoffMs[attempt]!);
+
+    const { data, error } = await supabase
+      .from("chat_flows")
+      .select("sorteo_id, updated_at")
+      .eq("empresa_id", empresaId)
+      .eq("flow_code", fc)
+      .order("updated_at", { ascending: false })
+      .limit(10);
+
+    if (error) {
+      lastError = error.message;
+      console.warn(
+        "[sorteo-flow-lookup] intento",
+        attempt + 1,
+        "de",
+        backoffMs.length,
+        "falló:",
+        error.message
+      );
+      continue;
+    }
+
+    /** Sin filas: el flujo no existe en el catálogo. Es ausencia real, no error. */
+    if (!data?.length) return { kind: "none" };
+
+    const row = data.find((r) => {
+      const sid = (r as { sorteo_id?: string | null }).sorteo_id;
+      return typeof sid === "string" && sid.length > 0;
+    }) as { sorteo_id?: string | null } | undefined;
+
+    const sid = row?.sorteo_id;
+    if (typeof sid === "string" && sid.length > 0) return { kind: "ok", sorteoId: sid };
+    return { kind: "none" };
+  }
+
+  return { kind: "error", message: lastError || "no se pudo consultar chat_flows" };
+}
+
+/**
+ * Compatibilidad: mismo contrato de siempre (`string | null`) para los llamadores que no
+ * necesitan distinguir el motivo. Ahora heredan los reintentos.
+ */
 export async function getSorteoIdForChatFlow(
   supabase: AppSupabaseClient,
   empresaId: string,
   flowCode: string
 ): Promise<string | null> {
-  const fc = flowCode.trim();
-  if (!fc) return null;
-  const { data, error } = await supabase
-    .from("chat_flows")
-    .select("sorteo_id, updated_at")
-    .eq("empresa_id", empresaId)
-    .eq("flow_code", fc)
-    .order("updated_at", { ascending: false })
-    .limit(10);
-  if (error || !data?.length) return null;
-  const row = data.find((r) => {
-    const sid = (r as { sorteo_id?: string | null }).sorteo_id;
-    return typeof sid === "string" && sid.length > 0;
-  }) as { sorteo_id?: string | null } | undefined;
-  const sid = row?.sorteo_id;
-  return typeof sid === "string" ? sid : null;
+  const out = await lookupSorteoIdForChatFlow(supabase, empresaId, flowCode);
+  return out.kind === "ok" ? out.sorteoId : null;
 }
 
 export type EnsureSorteoOrderFromChatInput = {
