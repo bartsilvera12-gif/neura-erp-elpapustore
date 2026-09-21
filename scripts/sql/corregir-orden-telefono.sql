@@ -5,7 +5,11 @@
 -- el bot. Las órdenes creadas ANTES de desplegar el fix tienen esa columna en NULL y por eso
 -- el PNG cae al respaldo `whatsapp_numero` (la línea desde la que escribió).
 --
--- Schema: elpapustore_erp. Cambiar el número de orden en las líneas marcadas «ORDEN».
+-- CUIDADO: `numero_orden` NO identifica una fila. Es un contador POR SORTEO
+-- (`sorteos.ultimo_numero_orden`) y no tiene índice único: el mismo número existe en varios
+-- sorteos a la vez. Por eso acá se busca por numero_orden pero se CORRIGE por `id` (uuid).
+--
+-- Schema: elpapustore_erp. El paso 1 da el `entrada_id` que va en el paso 2.
 -- El paso 1 no escribe nada.
 -- =============================================================================
 
@@ -18,6 +22,9 @@
 --      guarda el flujo no está en la lista de abajo → copiá `todos_los_campos_del_flujo` y
 --      pasámelo, porque entonces el fix tampoco lo va a tomar en las compras nuevas.
 --   b) `campo_donde_lo_guardo`: el nombre exacto del save_as_field del nodo.
+--
+-- Puede devolver VARIAS filas (mismo número de orden en distintos sorteos): identificá la
+-- correcta por nombre / whatsapp / sorteo y copiá SU `entrada_id` para el paso 2.
 -- -----------------------------------------------------------------------------
 WITH alias_telefono AS (
   SELECT unnest(ARRAY[
@@ -30,6 +37,7 @@ WITH alias_telefono AS (
 SELECT
   e.id                AS entrada_id,
   e.numero_orden,
+  s.nombre            AS sorteo,
   e.nombre_participante,
   e.whatsapp_numero   AS linea_de_whatsapp,
   e.telefono_contacto AS telefono_que_se_imprime,
@@ -47,6 +55,7 @@ SELECT
     ) x
   ) AS todos_los_campos_del_flujo
 FROM elpapustore_erp.sorteo_entradas e
+LEFT JOIN elpapustore_erp.sorteos s ON s.id = e.sorteo_id
 LEFT JOIN LATERAL (
   SELECT fd.field_name, fd.field_value
   FROM elpapustore_erp.chat_flow_data fd
@@ -57,17 +66,19 @@ LEFT JOIN LATERAL (
   ORDER BY fd.created_at DESC
   LIMIT 1
 ) decl ON true
-WHERE e.numero_orden = 6584;   -- «ORDEN»
+WHERE e.numero_orden = 6584;   -- «ORDEN» — puede devolver varias filas
 
 
 -- -----------------------------------------------------------------------------
 -- PASO 2 — Corrección.
 --
+-- Se corrige POR `id`, no por numero_orden: pegá el `entrada_id` que devolvió el paso 1.
 -- Toma solo el número que la persona declaró en el bot: no hay que transcribir nada.
 -- Para forzarlo a mano (si el paso 1 mostró NULL), poné el número entre las comillas de
 -- NULLIF('', '') — por ejemplo NULLIF('0973592372', '').
 --
--- En transacción: el RETURNING tiene que devolver EXACTAMENTE una fila.
+-- En transacción: el RETURNING tiene que devolver EXACTAMENTE una fila, y tiene que ser la
+-- persona que esperás. Si devuelve más de una, ROLLBACK.
 -- -----------------------------------------------------------------------------
 BEGIN;
 
@@ -92,7 +103,7 @@ UPDATE elpapustore_erp.sorteo_entradas e
        )
        -- Descomentar SOLO si el nombre también salió mal:
        -- , nombre_participante = 'Nombre Apellido'
- WHERE e.numero_orden = 6584                -- «ORDEN»
+ WHERE e.id = 'PEGAR-ENTRADA-ID-DEL-PASO-1'::uuid          -- «ENTRADA»
 RETURNING e.id, e.numero_orden, e.nombre_participante, e.whatsapp_numero, e.telefono_contacto;
 
 -- Si telefono_contacto volvió NULL: el flujo no guardó el celular en ninguno de los alias.
@@ -104,7 +115,7 @@ UPDATE elpapustore_erp.clientes c
    SET telefono_secundario = e.telefono_contacto
        -- , nombre = 'Nombre Apellido', nombre_contacto = 'Nombre Apellido'
   FROM elpapustore_erp.sorteo_entradas e
- WHERE e.numero_orden = 6584                -- «ORDEN»
+ WHERE e.id = 'PEGAR-ENTRADA-ID-DEL-PASO-1'::uuid          -- «ENTRADA»
    AND c.id = e.cliente_id
    AND e.telefono_contacto IS NOT NULL
 RETURNING c.id, c.nombre, c.telefono AS whatsapp, c.telefono_secundario AS celular_declarado;
@@ -124,7 +135,7 @@ COMMIT;
 SELECT d.id AS ticket_id, d.status, d.template_revision, d.is_current, d.created_at
   FROM elpapustore_erp.sorteo_ticket_deliveries d
   JOIN elpapustore_erp.sorteo_entradas e ON e.id = d.entrada_id
- WHERE e.numero_orden = 6584                -- «ORDEN»
+ WHERE e.id = 'PEGAR-ENTRADA-ID-DEL-PASO-1'::uuid          -- «ENTRADA»
  ORDER BY d.template_revision DESC;
 
 
@@ -168,3 +179,57 @@ SELECT
 FROM declarado
 WHERE tel_declarado IS NOT NULL
 ORDER BY numero_orden DESC;
+
+
+-- =============================================================================
+-- VERIFICACIÓN — si alguna vez se corrió un UPDATE filtrando sólo por numero_orden.
+--
+-- Como el número se repite entre sorteos, ese UPDATE toca VARIAS entradas. El daño posible es
+-- pisar con NULL un telefono_contacto que ya estaba cargado (las filas cuyo flujo no declaró
+-- teléfono reciben NULL). Esta consulta muestra las entradas que hoy están sin teléfono
+-- declarado PERO lo tienen en el historial del chat: esas son las recuperables.
+-- =============================================================================
+SELECT
+  e.id AS entrada_id,
+  e.numero_orden,
+  e.nombre_participante,
+  e.whatsapp_numero,
+  (
+    SELECT fd.field_value
+    FROM elpapustore_erp.chat_flow_data fd
+    WHERE fd.conversation_id = e.chat_conversation_id
+      AND lower(trim(fd.field_name)) IN (
+        'telefono_contacto','telefono','teléfono','telefono_celular','numero_telefono',
+        'nro_telefono','celular','numero_celular','número_celular','nro_celular',
+        'num_celular','movil','móvil','numero_contacto','número_contacto',
+        'whatsapp','numero_whatsapp','phone','mobile'
+      )
+      AND length(regexp_replace(coalesce(fd.field_value,''), '\D', '', 'g')) >= 6
+      AND fd.field_value !~ '[a-zA-ZáéíóúÁÉÍÓÚñÑ]'
+    ORDER BY fd.created_at DESC
+    LIMIT 1
+  ) AS recuperable_del_chat
+FROM elpapustore_erp.sorteo_entradas e
+WHERE e.numero_orden = 6584          -- el número que se corrigió
+  AND e.telefono_contacto IS NULL;
+
+
+-- =============================================================================
+-- ¿El número de orden se repite DENTRO de un mismo sorteo?
+--
+-- Entre sorteos distintos es normal: el contador es por sorteo. Dentro del mismo sorteo sería
+-- un problema aparte — dos compradores con el mismo "Nº de orden" impreso en su boleta.
+-- =============================================================================
+SELECT
+  e.sorteo_id,
+  s.nombre AS sorteo,
+  e.numero_orden,
+  count(*) AS entradas_con_ese_numero,
+  string_agg(e.nombre_participante, ' | ' ORDER BY e.created_at) AS participantes
+FROM elpapustore_erp.sorteo_entradas e
+LEFT JOIN elpapustore_erp.sorteos s ON s.id = e.sorteo_id
+WHERE e.numero_orden IS NOT NULL
+GROUP BY e.sorteo_id, s.nombre, e.numero_orden
+HAVING count(*) > 1
+ORDER BY count(*) DESC, e.numero_orden DESC
+LIMIT 50;
