@@ -85,10 +85,10 @@ async function main() {
       const fdR = convId
         ? await pool.query(
             `SELECT DISTINCT ON (field_name)
-                    field_name, left(field_value, 200) AS field_value, flow_session_id, updated_at
+                    field_name, left(field_value, 200) AS field_value, flow_session_id, created_at
                FROM "${SCHEMA}".chat_flow_data
               WHERE conversation_id = $1::uuid
-              ORDER BY field_name, updated_at DESC`,
+              ORDER BY field_name, created_at DESC`,
             [convId]
           )
         : { rows: [] };
@@ -154,7 +154,7 @@ async function main() {
                 campo: r.field_name,
                 valor: r.field_value,
                 sesion: r.flow_session_id,
-                actualizado: r.updated_at,
+                creado: r.created_at,
               })),
             sesiones_distintas_en_la_conversacion: [
               ...new Set(flowRows.map((r) => String(r.flow_session_id ?? ""))),

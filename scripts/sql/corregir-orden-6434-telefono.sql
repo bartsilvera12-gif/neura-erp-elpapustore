@@ -35,18 +35,18 @@ SELECT
         'whatsapp','numero_whatsapp','phone','mobile'
       )
       AND length(regexp_replace(coalesce(fd.field_value,''), '\D', '', 'g')) >= 6
-    ORDER BY fd.updated_at DESC
+    ORDER BY fd.created_at DESC
     LIMIT 1
   ) AS telefono_declarado_en_el_bot
 FROM elpapustore_erp.sorteo_entradas e
 WHERE e.numero_orden = 6434;
 
 -- Si querés ver TODOS los datos que cargó en esa conversación (para el nombre, por ejemplo):
--- SELECT DISTINCT ON (fd.field_name) fd.field_name, fd.field_value, fd.updated_at
+-- SELECT DISTINCT ON (fd.field_name) fd.field_name, fd.field_value, fd.created_at
 --   FROM elpapustore_erp.chat_flow_data fd
 --   JOIN elpapustore_erp.sorteo_entradas e ON e.chat_conversation_id = fd.conversation_id
 --  WHERE e.numero_orden = 6434
---  ORDER BY fd.field_name, fd.updated_at DESC;
+--  ORDER BY fd.field_name, fd.created_at DESC;
 
 
 -- -----------------------------------------------------------------------------
@@ -124,7 +124,7 @@ WITH declarado AS (
         )
         AND length(regexp_replace(coalesce(fd.field_value,''), '\D', '', 'g')) >= 6
         AND fd.field_value !~ '[a-zA-ZáéíóúÁÉÍÓÚñÑ]'
-      ORDER BY fd.updated_at DESC
+      ORDER BY fd.created_at DESC
       LIMIT 1
     ) AS tel_declarado
   FROM elpapustore_erp.sorteo_entradas e
@@ -161,7 +161,7 @@ ORDER BY numero_orden DESC;
 --        )
 --        AND length(regexp_replace(coalesce(fd.field_value,''), '\D', '', 'g')) >= 6
 --        AND fd.field_value !~ '[a-zA-ZáéíóúÁÉÍÓÚñÑ]'
---      ORDER BY fd.updated_at DESC
+--      ORDER BY fd.created_at DESC
 --      LIMIT 1
 --    )
 --  WHERE e.telefono_contacto IS NULL
