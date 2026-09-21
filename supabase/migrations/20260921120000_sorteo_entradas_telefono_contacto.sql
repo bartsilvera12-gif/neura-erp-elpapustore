@@ -7,31 +7,30 @@
 --
 -- Columna nullable y sin backfill: las órdenes anteriores siguen mostrando el WhatsApp como
 -- respaldo (`buildSorteoTicketRenderData`), no quedan sin teléfono impreso.
--- Réplica multi-schema, igual que el resto de columnas de sorteo_entradas.
+--
+-- Recorre TODOS los schemas donde exista cada tabla — `public`, la plantilla `zentra_erp` y los
+-- tenants `erp_*` / `er_*` — sin asumir que alguno esté instalado: hay bases donde los sorteos
+-- viven sólo en el schema del tenant y `public.sorteo_entradas` no existe (42P01).
+-- Idempotente: se puede correr de nuevo sin efecto.
 -- =============================================================================
 
-ALTER TABLE public.sorteo_entradas
-  ADD COLUMN IF NOT EXISTS telefono_contacto text;
-
-COMMENT ON COLUMN public.sorteo_entradas.telefono_contacto IS
-  'Celular declarado por el comprador en el flujo / carga manual. Es el que se imprime en la boleta; whatsapp_numero es la línea remitente.';
-
--- Plantilla zentra_erp
-ALTER TABLE zentra_erp.sorteo_entradas
-  ADD COLUMN IF NOT EXISTS telefono_contacto text;
-
--- Schemas tenant erp_* / er_*
 DO $$
 DECLARE
   sch text;
 BEGIN
   FOR sch IN
-    SELECT nspname::text
-    FROM pg_namespace
-    WHERE (nspname ~ '^erp_[a-zA-Z0-9_]+$' OR nspname ~ '^er_[0-9a-f]{32}$')
-      AND EXISTS (
-        SELECT 1 FROM information_schema.tables t
-        WHERE t.table_schema = nspname AND t.table_name = 'sorteo_entradas'
+    -- pg_catalog en vez de information_schema: este último oculta las tablas sobre las que
+    -- el rol actual no tiene privilegios, y ahí un schema quedaría sin la columna en silencio.
+    SELECT n.nspname::text
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'sorteo_entradas'
+      AND c.relkind IN ('r', 'p')
+      AND (
+        n.nspname = 'public'
+        OR n.nspname = 'zentra_erp'
+        OR n.nspname ~ '^erp_[a-zA-Z0-9_]+$'
+        OR n.nspname ~ '^er_[0-9a-f]{32}$'
       )
   LOOP
     BEGIN
@@ -39,8 +38,14 @@ BEGIN
         'ALTER TABLE %I.sorteo_entradas ADD COLUMN IF NOT EXISTS telefono_contacto text;',
         sch
       );
-    EXCEPTION WHEN undefined_table THEN
-      RAISE NOTICE 'sorteo_entradas telefono_contacto skipped for schema %', sch;
+      EXECUTE format(
+        'COMMENT ON COLUMN %I.sorteo_entradas.telefono_contacto IS %L;',
+        sch,
+        'Celular declarado por el comprador en el flujo / carga manual. Es el que se imprime en la boleta; whatsapp_numero es la línea remitente.'
+      );
+      RAISE NOTICE 'sorteo_entradas.telefono_contacto listo en %', sch;
+    EXCEPTION WHEN undefined_table OR insufficient_privilege THEN
+      RAISE NOTICE 'sorteo_entradas.telefono_contacto omitido en %: %', sch, SQLERRM;
     END;
   END LOOP;
 END;
@@ -53,12 +58,18 @@ DECLARE
   sch text;
 BEGIN
   FOR sch IN
-    SELECT nspname::text
-    FROM pg_namespace
-    WHERE (nspname ~ '^erp_[a-zA-Z0-9_]+$' OR nspname ~ '^er_[0-9a-f]{32}$' OR nspname = 'zentra_erp')
-      AND EXISTS (
-        SELECT 1 FROM information_schema.tables t
-        WHERE t.table_schema = nspname AND t.table_name = 'clientes'
+    -- pg_catalog en vez de information_schema: este último oculta las tablas sobre las que
+    -- el rol actual no tiene privilegios, y ahí un schema quedaría sin la columna en silencio.
+    SELECT n.nspname::text
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'clientes'
+      AND c.relkind IN ('r', 'p')
+      AND (
+        n.nspname = 'public'
+        OR n.nspname = 'zentra_erp'
+        OR n.nspname ~ '^erp_[a-zA-Z0-9_]+$'
+        OR n.nspname ~ '^er_[0-9a-f]{32}$'
       )
   LOOP
     BEGIN
@@ -66,8 +77,9 @@ BEGIN
         'ALTER TABLE %I.clientes ADD COLUMN IF NOT EXISTS telefono_secundario text;',
         sch
       );
-    EXCEPTION WHEN undefined_table THEN
-      RAISE NOTICE 'clientes telefono_secundario skipped for schema %', sch;
+      RAISE NOTICE 'clientes.telefono_secundario listo en %', sch;
+    EXCEPTION WHEN undefined_table OR insufficient_privilege THEN
+      RAISE NOTICE 'clientes.telefono_secundario omitido en %: %', sch, SQLERRM;
     END;
   END LOOP;
 END;
