@@ -1,6 +1,10 @@
 import type { AppSupabaseClient } from "@/lib/supabase/schema";
 import { prepareFlowDataForSorteoOrder } from "@/lib/sorteos/sorteo-order-from-chat";
 import { readSorteoCantidadNumericFromMap } from "@/lib/sorteos/sorteo-cantidad-fields";
+import {
+  TELEFONO_CONTACTO_FLOW_KEYS,
+  isTelefonoContactoFieldKey,
+} from "@/lib/sorteos/sorteo-telefono-contacto";
 
 function norm(s: string | undefined | null): string {
   return (s ?? "").trim();
@@ -28,9 +32,19 @@ const APELLIDO_KEYS = new Set(["apellido", "primer_apellido", "apellidos"]);
 
 const CIUDAD_KEYS = new Set(["ciudad", "localidad", "ubicacion", "ubicación"]);
 
-function bucketForSaveField(saveAs: string): "cedula" | "nombre" | "apellido" | "ciudad" | "other" {
+const TELEFONO_KEYS = new Set(TELEFONO_CONTACTO_FLOW_KEYS.map(normalizeFlowFieldKey));
+
+function bucketForSaveField(
+  saveAs: string
+): "cedula" | "nombre" | "apellido" | "ciudad" | "telefono" | "other" {
   const s = normalizeFlowFieldKey(saveAs);
   if (!s) return "other";
+  /**
+   * Teléfono primero: es dato del participante igual que cédula o ciudad, así que no puede
+   * heredarse de una compra anterior ni sobrevivir a "No, ingresar nuevo". Antes caía en
+   * "other" y se arrastraba entre sesiones de la misma conversación.
+   */
+  if (TELEFONO_KEYS.has(s) || isTelefonoContactoFieldKey(s)) return "telefono";
   if (CEDULA_KEYS.has(s) || /documento|cedula|^ci$|dni|ruc|numero_document|nro_document/.test(s)) {
     return "cedula";
   }
@@ -42,7 +56,7 @@ function bucketForSaveField(saveAs: string): "cedula" | "nombre" | "apellido" | 
 
 /**
  * ¿Esta clave de guardado corresponde a un dato de IDENTIDAD del participante
- * (cedula/documento, nombre, apellido, ciudad)? Usa el MISMO clasificador que el gate
+ * (cedula/documento, nombre, apellido, ciudad, teléfono de contacto)? Usa el MISMO clasificador que el gate
  * de completitud (`bucketForSaveField`), para que cualquier exclusión basada en identidad
  * no pueda divergir de los buckets que deciden la creación de la orden. Cubre alias y
  * acentos (ci/dni/ruc/nro_documento/numero_documento/cédula/nombres/apellidos/ubicación).
@@ -66,6 +80,7 @@ export function flowDataHasValueForCaptureSaveField(
   if (bucket === "nombre") NOMBRE_KEYS.forEach((k) => keysToCheck.add(k));
   if (bucket === "apellido") APELLIDO_KEYS.forEach((k) => keysToCheck.add(k));
   if (bucket === "ciudad") CIUDAD_KEYS.forEach((k) => keysToCheck.add(k));
+  if (bucket === "telefono") TELEFONO_KEYS.forEach((k) => keysToCheck.add(k));
   for (const [k, v] of Object.entries(prep)) {
     const kn = normalizeFlowFieldKey(k);
     if (!norm(v)) continue;

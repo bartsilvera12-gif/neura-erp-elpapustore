@@ -2,6 +2,7 @@ import "server-only";
 
 import type { SorteoTicketEntradaDbSnapshot } from "@/lib/sorteos/sorteo-ticket-admin";
 import type { EnsureSorteoOrderCreatedData } from "@/lib/sorteos/sorteo-order-from-chat";
+import { readTelefonoContactoFromFlowData } from "@/lib/sorteos/sorteo-telefono-contacto";
 
 function norm(v: string | undefined | null): string {
   return typeof v === "string" ? v.trim() : "";
@@ -132,13 +133,7 @@ function documentoFromFlow(flowData: Record<string, string>): string {
 }
 
 function telefonoFromFlow(flowData: Record<string, string>): string {
-  return (
-    norm(flowData["telefono"]) ||
-    norm(flowData["celular"]) ||
-    norm(flowData["whatsapp"]) ||
-    norm(flowData["phone"]) ||
-    ""
-  );
+  return readTelefonoContactoFromFlowData(flowData);
 }
 
 function ciudadFromFlow(flowData: Record<string, string>): string {
@@ -155,6 +150,8 @@ export type SorteoTicketNormalizedRenderFields = {
   clienteNombre: string;
   documento: string;
   telefono: string;
+  /** De dónde salió `telefono`: para auditar boletas sin celular declarado. */
+  telefonoFuente: "declarado" | "whatsapp" | "";
   ciudad: string;
   numeroOrden: string;
   sorteoNombre: string;
@@ -262,7 +259,22 @@ export function buildSorteoTicketRenderData(input: {
     buildNombreCompletoFromParts(flowData)
   ).trim();
   const documento = (entradaDb?.documento?.trim() || documentoFromFlow(flowData)).trim();
-  const telefono = (entradaDb?.telefono?.trim() || telefonoFromFlow(flowData)).trim();
+  /**
+   * Teléfono: manda SIEMPRE el celular que la persona declaró y confirmó en el bot
+   * (`sorteo_entradas.telefono_contacto`, o la captura del flujo si la orden es anterior a esa
+   * columna). `whatsapp_numero` es la línea desde la que escribió — útil para entregarle el
+   * ticket, pero no es el dato que pidió que se imprima — así que queda como último recurso
+   * para que una boleta vieja no salga sin teléfono.
+   */
+  const telefonoDeclarado = (
+    entradaDb?.telefonoContacto?.trim() || telefonoFromFlow(flowData)
+  ).trim();
+  const telefono = telefonoDeclarado || (entradaDb?.telefono?.trim() ?? "");
+  const telefonoFuente: "declarado" | "whatsapp" | "" = telefonoDeclarado
+    ? "declarado"
+    : telefono
+      ? "whatsapp"
+      : "";
   /** Ciudad: se captura en el flujo (nodo `ciudad`) → chat_flow_data. `sorteo_entradas` no la guarda. */
   const ciudad = ciudadFromFlow(flowData).trim();
 
@@ -282,6 +294,7 @@ export function buildSorteoTicketRenderData(input: {
     clienteNombre,
     documento,
     telefono,
+    telefonoFuente,
     ciudad,
     numeroOrden,
     sorteoNombre,
@@ -303,6 +316,7 @@ export function buildSorteoTicketRenderLogPayload(input: {
     clienteNombre: Boolean(f.clienteNombre.trim()),
     documento: Boolean(f.documento.trim()),
     telefono: Boolean(f.telefono.trim()),
+    telefonoFuente: f.telefonoFuente,
     ciudad: Boolean(f.ciudad.trim()),
     sorteoNombre: Boolean(f.sorteoNombre.trim()),
   };

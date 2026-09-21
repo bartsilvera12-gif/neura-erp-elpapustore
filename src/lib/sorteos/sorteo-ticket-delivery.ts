@@ -112,9 +112,17 @@ async function loadChatFlowDataNewestPerField(
   if (!cid) return {};
   const { data, error } = await sb
     .from("chat_flow_data")
-    .select("field_name, field_value, updated_at")
+    /**
+     * `created_at`, no `updated_at`: la tabla no tiene esa columna (ver
+     * 20250329180000_chat_flow_text_capture.sql) y la consulta fallaba siempre, así que el
+     * ticket se renderizaba sin NADA del historial del chat —la ciudad, por ejemplo, sale sólo
+     * de acá—. El resto de los lectores de chat_flow_data ya usaban created_at.
+     * El orden importa: el índice vigente es único por (flow_session_id, field_name), o sea
+     * que una conversación con varias sesiones tiene varias filas del mismo campo.
+     */
+    .select("field_name, field_value, created_at")
     .eq("conversation_id", cid)
-    .order("updated_at", { ascending: false });
+    .order("created_at", { ascending: false });
   if (error || !data?.length) {
     if (error) {
       console.warn("[sorteo-ticket] chat_flow_data_load_warn", { message: error.message });

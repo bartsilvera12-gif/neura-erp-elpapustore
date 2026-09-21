@@ -13,6 +13,7 @@ type ClienteRow = {
   documento?: string | null;
   ciudad?: string | null;
   telefono?: string | null;
+  telefono_secundario?: string | null;
 };
 
 function norm(s: string | null | undefined): string {
@@ -40,7 +41,7 @@ export async function fetchIdentityRecallCliente(
 
   const { data, error } = await supabase
     .from("clientes")
-    .select("id, nombre, nombre_contacto, documento, ciudad, telefono")
+    .select("id, nombre, nombre_contacto, documento, ciudad, telefono, telefono_secundario")
     .eq("empresa_id", empresaId)
     .is("deleted_at", null)
     .in("telefono", variants)
@@ -63,7 +64,13 @@ export async function fetchIdentityRecallCliente(
       nombreCompleto,
       cedula,
       ciudad: norm(raw.ciudad),
-      telefono: norm(raw.telefono) || norm(phone),
+      /**
+       * Celular DECLARADO en compras anteriores (`telefono_secundario`). `clientes.telefono`
+       * guarda el WhatsApp desde el que escribe —es la clave de esta misma búsqueda—, así que
+       * no sirve como dato a confirmar: mostrarlo haría que el comprador aprobara el número
+       * equivocado. Si no hay declarado va vacío y el flujo vuelve a pedir el celular.
+       */
+      telefono: norm(raw.telefono_secundario),
     };
   }
 

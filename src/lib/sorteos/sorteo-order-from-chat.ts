@@ -17,6 +17,7 @@ import {
   propagateSorteoCantidadAliasesIntoCanonical,
   readSorteoCantidadNumericFromMap,
 } from "@/lib/sorteos/sorteo-cantidad-fields";
+import { readTelefonoContactoFromFlowData } from "@/lib/sorteos/sorteo-telefono-contacto";
 
 /** Clave estable: mismo comprobante (media) en misma conversación y flujo → una sola orden. */
 export function buildSorteoIdempotencyKey(
@@ -508,6 +509,8 @@ export function parseSorteoParticipantFromFlowData(data: Record<string, string>)
   nombre_completo: string;
   cedula: string;
   ciudad: string;
+  /** Celular declarado en el flujo. `""` si el flujo no lo pide: no bloquea el cierre. */
+  telefono_contacto: string;
   cantidad_boletos: number;
 } | null {
   let qty = NaN;
@@ -559,6 +562,7 @@ export function parseSorteoParticipantFromFlowData(data: Record<string, string>)
       norm(data["numero_documento"]) ||
       norm(data["ci"]),
     ciudad: norm(data["ciudad"]),
+    telefono_contacto: readTelefonoContactoFromFlowData(data),
     cantidad_boletos: qty,
   };
 }
@@ -1090,6 +1094,7 @@ export async function ensureSorteoOrderFromChat(
     nombre_completo: participant.nombre_completo,
     cedula: participant.cedula || "",
     ciudad: participant.ciudad || "",
+    telefono_contacto: participant.telefono_contacto || "",
     cantidad_boletos: participant.cantidad_boletos,
     comprobante_url: input.comprobanteUrl,
     validado_por: "chat_flow",
@@ -1138,6 +1143,7 @@ export async function ensureSorteoOrderFromChat(
     nombreCompleto: participant.nombre_completo,
     cedula: participant.cedula || "",
     ciudad: participant.ciudad || "",
+    telefonoContacto: participant.telefono_contacto || "",
     cantidadBoletos: participant.cantidad_boletos,
     comprobanteUrl: input.comprobanteUrl,
     validadoPor: "chat_flow",
@@ -1169,6 +1175,8 @@ export async function ensureSorteoOrderFromChat(
   }
 
   let row: Record<string, unknown> | null = null;
+  /** El camino directo ya escribe `telefono_contacto`; la RPC pública todavía no lo recibe. */
+  let usedDirectPg = false;
 
   if (useCustomCouponNumbering) {
     if (!hasDirectPg) {
@@ -1183,6 +1191,7 @@ export async function ensureSorteoOrderFromChat(
       return { ok: false, message: directOut.message };
     }
     row = mapDirectPgOkToRpcRow(directOut);
+    usedDirectPg = true;
     console.info(FLOW_SORTEO_LOG, "ensureSorteoOrderFromChat_path", {
       path: "direct_pg_custom_coupon_numbering",
       schema: dataSchema,
@@ -1201,6 +1210,7 @@ export async function ensureSorteoOrderFromChat(
       return { ok: false, message: directOut.message };
     }
     row = mapDirectPgOkToRpcRow(directOut);
+    usedDirectPg = true;
     console.info(FLOW_SORTEO_LOG, "ensureSorteoOrderFromChat_path", {
       path: "direct_pg_tenant",
       schema: dataSchema,
@@ -1238,6 +1248,7 @@ export async function ensureSorteoOrderFromChat(
           return { ok: false, message: directOut.message };
         }
         row = mapDirectPgOkToRpcRow(directOut);
+    usedDirectPg = true;
         console.info(FLOW_SORTEO_LOG, "ensureSorteoOrderFromChat_path", {
           path: "direct_pg_fallback_after_rpc_missing",
           schema: dataSchema,
@@ -1319,6 +1330,30 @@ export async function ensureSorteoOrderFromChat(
       rawRow: row,
     });
     return { ok: false, message: incompleteMsg };
+  }
+
+  /**
+   * Camino RPC (schema público): `sorteos_ensure_order_from_chat` todavía no recibe el teléfono
+   * declarado, así que se completa acá. Sólo rellena si el campo quedó vacío, para que un
+   * reintento idempotente no pise el número de la orden original. Tolerante a fallos: la compra
+   * ya está creada y el ticket igual tiene el fallback del WhatsApp.
+   */
+  if (!usedDirectPg && participant.telefono_contacto) {
+    const dbEntradas =
+      dataSchema === SUPABASE_APP_SCHEMA ? supabase : createServiceRoleClientWithDbSchema(dataSchema);
+    const { error: telErr } = await dbEntradas
+      .from("sorteo_entradas")
+      .update({ telefono_contacto: participant.telefono_contacto })
+      .eq("id", entradaId)
+      .eq("empresa_id", input.empresaId)
+      .is("telefono_contacto", null);
+    if (telErr) {
+      console.warn(FLOW_SORTEO_LOG, "telefono_contacto_update_warn", {
+        entradaId,
+        conversationId: input.conversationId,
+        message: telErr.message,
+      });
+    }
   }
 
   const cbRaw = entrada?.cantidad_boletos;
