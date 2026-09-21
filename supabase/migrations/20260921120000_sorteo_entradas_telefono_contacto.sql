@@ -8,79 +8,72 @@
 -- Columna nullable y sin backfill: las órdenes anteriores siguen mostrando el WhatsApp como
 -- respaldo (`buildSorteoTicketRenderData`), no quedan sin teléfono impreso.
 --
--- Recorre TODOS los schemas donde exista cada tabla — `public`, la plantilla `zentra_erp` y los
--- tenants `erp_*` / `er_*` — sin asumir que alguno esté instalado: hay bases donde los sorteos
--- viven sólo en el schema del tenant y `public.sorteo_entradas` no existe (42P01).
+-- Multi-schema: recorre TODO schema que tenga la tabla (public, zentra_erp, tenant er_*/erp_*
+-- y los schemas dedicados single_client como `elpapustore_erp`, que no matchean `erp\_%`).
+-- No asume que las tablas existan en `public`: en una instancia single_client viven sólo en el
+-- schema del cliente, y un ALTER directo sobre public corta la migración entera con 42P01.
 -- Idempotente: se puede correr de nuevo sin efecto.
 -- =============================================================================
 
 DO $$
 DECLARE
-  sch text;
+  r RECORD;
 BEGIN
-  FOR sch IN
-    -- pg_catalog en vez de information_schema: este último oculta las tablas sobre las que
-    -- el rol actual no tiene privilegios, y ahí un schema quedaría sin la columna en silencio.
-    SELECT n.nspname::text
+  FOR r IN
+    SELECT n.nspname AS sch
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relname = 'sorteo_entradas'
-      AND c.relkind IN ('r', 'p')
-      AND (
-        n.nspname = 'public'
-        OR n.nspname = 'zentra_erp'
-        OR n.nspname ~ '^erp_[a-zA-Z0-9_]+$'
-        OR n.nspname ~ '^er_[0-9a-f]{32}$'
-      )
+      AND c.relkind = 'r'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname NOT LIKE 'pg_%'
   LOOP
     BEGIN
       EXECUTE format(
-        'ALTER TABLE %I.sorteo_entradas ADD COLUMN IF NOT EXISTS telefono_contacto text;',
-        sch
+        'ALTER TABLE %I.sorteo_entradas ADD COLUMN IF NOT EXISTS telefono_contacto text',
+        r.sch
       );
       EXECUTE format(
-        'COMMENT ON COLUMN %I.sorteo_entradas.telefono_contacto IS %L;',
-        sch,
+        'COMMENT ON COLUMN %I.sorteo_entradas.telefono_contacto IS %L',
+        r.sch,
         'Celular declarado por el comprador en el flujo / carga manual. Es el que se imprime en la boleta; whatsapp_numero es la línea remitente.'
       );
-      RAISE NOTICE 'sorteo_entradas.telefono_contacto listo en %', sch;
-    EXCEPTION WHEN undefined_table OR insufficient_privilege THEN
-      RAISE NOTICE 'sorteo_entradas.telefono_contacto omitido en %: %', sch, SQLERRM;
+    EXCEPTION WHEN others THEN
+      /** Un schema sin permisos o con la tabla a medio instalar no aborta el resto. */
+      RAISE NOTICE 'sorteo_entradas.telefono_contacto [%]: %', r.sch, SQLERRM;
     END;
   END LOOP;
-END;
-$$;
+END $$;
 
--- `clientes.telefono_secundario` guarda el mismo dato del lado CRM (telefono sigue siendo el
--- WhatsApp: es la clave con la que la recompra rápida reconoce al comprador).
+-- -----------------------------------------------------------------------------
+-- `clientes.telefono_secundario`: el mismo dato del lado CRM. `clientes.telefono` sigue siendo
+-- el WhatsApp, porque es la clave con la que la recompra rápida reconoce al comprador.
+-- -----------------------------------------------------------------------------
 DO $$
 DECLARE
-  sch text;
+  r RECORD;
 BEGIN
-  FOR sch IN
-    -- pg_catalog en vez de information_schema: este último oculta las tablas sobre las que
-    -- el rol actual no tiene privilegios, y ahí un schema quedaría sin la columna en silencio.
-    SELECT n.nspname::text
+  FOR r IN
+    SELECT n.nspname AS sch
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relname = 'clientes'
-      AND c.relkind IN ('r', 'p')
-      AND (
-        n.nspname = 'public'
-        OR n.nspname = 'zentra_erp'
-        OR n.nspname ~ '^erp_[a-zA-Z0-9_]+$'
-        OR n.nspname ~ '^er_[0-9a-f]{32}$'
-      )
+      AND c.relkind = 'r'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname NOT LIKE 'pg_%'
   LOOP
     BEGIN
       EXECUTE format(
-        'ALTER TABLE %I.clientes ADD COLUMN IF NOT EXISTS telefono_secundario text;',
-        sch
+        'ALTER TABLE %I.clientes ADD COLUMN IF NOT EXISTS telefono_secundario text',
+        r.sch
       );
-      RAISE NOTICE 'clientes.telefono_secundario listo en %', sch;
-    EXCEPTION WHEN undefined_table OR insufficient_privilege THEN
-      RAISE NOTICE 'clientes.telefono_secundario omitido en %: %', sch, SQLERRM;
+      EXECUTE format(
+        'COMMENT ON COLUMN %I.clientes.telefono_secundario IS %L',
+        r.sch,
+        'Celular declarado por el cliente. telefono guarda el WhatsApp con el que escribe (clave de la recompra rápida).'
+      );
+    EXCEPTION WHEN others THEN
+      RAISE NOTICE 'clientes.telefono_secundario [%]: %', r.sch, SQLERRM;
     END;
   END LOOP;
-END;
-$$;
+END $$;
