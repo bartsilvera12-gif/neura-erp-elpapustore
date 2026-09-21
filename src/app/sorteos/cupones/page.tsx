@@ -49,9 +49,12 @@ export default async function SorteoCuponesPage({
   const q = pickStr(sp, "q")?.trim() || undefined;
   const sorteoId = pickStr(sp, "sorteo_id")?.trim() || undefined;
   const estadoRaw = pickStr(sp, "estado")?.trim();
-  /** Cupones: solo estos tres estados en el filtro (sin `pendiente`). */
+  /** Cupones: estos estados en el filtro (sin `pendiente`). */
   const estadoPago: SorteoEntradaEstadoPago | undefined =
-    estadoRaw === "pendiente_revision" || estadoRaw === "confirmado" || estadoRaw === "rechazado"
+    estadoRaw === "pendiente_revision" ||
+    estadoRaw === "confirmado" ||
+    estadoRaw === "rechazado" ||
+    estadoRaw === "anulado"
       ? estadoRaw
       : undefined;
 

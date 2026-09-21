@@ -23,7 +23,7 @@ import { assertAllowedChatDataSchema } from "@/lib/supabase/chat-data-schema";
  *   el sorteo más reciente por `created_at`.
  *
  * Boletos: COUNT de `sorteo_cupones` unido a `sorteo_entradas` (un boleto = un cupón).
- * Montos: SUM(monto_total) en `sorteo_entradas`. Excluye `estado_pago = 'rechazado'`.
+ * Montos: SUM(monto_total) en `sorteo_entradas`. Excluye `estado_pago` `rechazado` y `anulado`.
  * Calendario del día: America/Asuncion (ver `kpis-time-bounds.ts`).
  */
 export type SorteosVentasKpis = {
@@ -52,7 +52,8 @@ function sumRows(
   let boletos = 0;
   let monto = 0;
   for (const r of rows) {
-    if ((r.estado_pago ?? "").trim() === "rechazado") continue;
+    const ep = (r.estado_pago ?? "").trim();
+    if (ep === "rechazado" || ep === "anulado") continue;
     boletos += Number(r.cantidad_boletos) || 0;
     monto += Number(r.monto_total) || 0;
   }
@@ -104,7 +105,7 @@ async function logDashboardDebug(
           `SELECT COUNT(c.id)::bigint AS n FROM ${tcup} c
            INNER JOIN ${tent} e ON e.id = c.entrada_id
            WHERE e.empresa_id = $1::uuid AND e.created_at >= $2::timestamptz AND e.created_at <= $3::timestamptz
-           AND e.estado_pago <> 'rechazado'`,
+           AND e.estado_pago NOT IN ('rechazado', 'anulado')`,
           [empresaId, day.start, day.end]
         ),
         current
@@ -112,7 +113,7 @@ async function logDashboardDebug(
               `SELECT COUNT(c.id)::bigint AS n FROM ${tcup} c
                INNER JOIN ${tent} e ON e.id = c.entrada_id
                WHERE e.empresa_id = $1::uuid AND e.sorteo_id = $2::uuid
-               AND e.estado_pago <> 'rechazado'`,
+               AND e.estado_pago NOT IN ('rechazado', 'anulado')`,
               [empresaId, current.id]
             )
           : Promise.resolve({ rows: [{ n: "0" }] } as { rows: Array<{ n?: string }> }),
@@ -161,7 +162,7 @@ async function fetchKpiWindowFromPg(
        INNER JOIN ${tent} e ON e.id = c.entrada_id
        WHERE e.empresa_id = $1::uuid
          AND e.created_at >= $2::timestamptz AND e.created_at <= $3::timestamptz
-         AND e.estado_pago <> 'rechazado'`,
+         AND e.estado_pago NOT IN ('rechazado', 'anulado')`,
       [empresaId, start, end]
     ),
     pool.query(
@@ -169,7 +170,7 @@ async function fetchKpiWindowFromPg(
        FROM ${tent} e
        WHERE e.empresa_id = $1::uuid
          AND e.created_at >= $2::timestamptz AND e.created_at <= $3::timestamptz
-         AND e.estado_pago <> 'rechazado'`,
+         AND e.estado_pago NOT IN ('rechazado', 'anulado')`,
       [empresaId, start, end]
     ),
   ]);
@@ -220,7 +221,7 @@ async function fetchSorteoLifetimeFromPg(
        INNER JOIN ${tent} e ON e.id = c.entrada_id
        WHERE e.empresa_id = $1::uuid
          AND e.sorteo_id = $2::uuid
-         AND e.estado_pago <> 'rechazado'`,
+         AND e.estado_pago NOT IN ('rechazado', 'anulado')`,
       [empresaId, sorteoId]
     ),
     pool.query(
@@ -228,7 +229,7 @@ async function fetchSorteoLifetimeFromPg(
        FROM ${tent} e
        WHERE e.empresa_id = $1::uuid
          AND e.sorteo_id = $2::uuid
-         AND e.estado_pago <> 'rechazado'`,
+         AND e.estado_pago NOT IN ('rechazado', 'anulado')`,
       [empresaId, sorteoId]
     ),
   ]);

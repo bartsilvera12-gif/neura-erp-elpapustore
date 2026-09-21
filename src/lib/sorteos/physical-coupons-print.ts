@@ -224,6 +224,12 @@ async function fetchPhysicalCouponsPgDirect(
     `se.empresa_id = c.empresa_id`,
     `so.id = c.sorteo_id`,
     `so.empresa_id = c.empresa_id`,
+    /**
+     * Una venta anulada no va a la urna: sus cupones no participan. Se filtra por
+     * `estado_pago` (columna de siempre) y no por `sorteo_cupones.anulado_at`, que es nueva:
+     * así la impresión no depende del orden en que se apliquen migración y deploy.
+     */
+    `se.estado_pago <> 'anulado'`,
   ];
 
   if (entradaId) {

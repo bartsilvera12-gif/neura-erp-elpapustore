@@ -10,7 +10,12 @@ function Inner() {
 
   const raw = sp?.get("estado")?.trim() ?? "";
   const value =
-    raw === "pendiente_revision" || raw === "confirmado" || raw === "rechazado" ? raw : "";
+    raw === "pendiente_revision" ||
+    raw === "confirmado" ||
+    raw === "rechazado" ||
+    raw === "anulado"
+      ? raw
+      : "";
 
   const applyEstado = useCallback(
     (nextEstado: string) => {
@@ -41,6 +46,7 @@ function Inner() {
         <option value="pendiente_revision">Pendiente revisión</option>
         <option value="confirmado">Aprobado</option>
         <option value="rechazado">Rechazado</option>
+        <option value="anulado">Anuladas</option>
       </select>
     </label>
   );

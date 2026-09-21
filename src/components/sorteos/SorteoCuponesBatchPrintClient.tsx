@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import type { SorteoCuponOrdenRow } from "@/lib/sorteos/types";
 import SorteoCuponesPagoCell from "@/components/sorteos/SorteoCuponesPagoCell";
 import SorteoCuponesImpresionCell from "@/components/sorteos/SorteoCuponesImpresionCell";
+import SorteoCuponesAnularCell from "@/components/sorteos/SorteoCuponesAnularCell";
 
 /** Sobre este umbral, "Imprimir todos los filtrados" pide confirmación. */
 const CONFIRM_TODOS_THRESHOLD = 300;
@@ -251,15 +252,23 @@ export default function SorteoCuponesBatchPrintClient({
                   <th className="px-5 py-3 text-left text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Pago</th>
                   <th className="px-5 py-3 text-left text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Fecha</th>
                   <th className="px-5 py-3 text-left text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Chat</th>
+                  <th className="px-5 py-3 text-left text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Acciones</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {rows.map((r) => {
                   const checked = selected.has(r.entrada_id);
+                  const anulada = String(r.estado_pago ?? "").trim() === "anulado";
                   return (
                     <tr
                       key={r.entrada_id}
-                      className={checked ? "bg-[#4FAEB2]/5" : "hover:bg-slate-50/80"}
+                      className={
+                        anulada
+                          ? "bg-slate-50 text-slate-400 line-through decoration-slate-300"
+                          : checked
+                            ? "bg-[#4FAEB2]/5"
+                            : "hover:bg-slate-50/80"
+                      }
                     >
                       <td className="px-4 py-3">
                         <input
@@ -305,6 +314,14 @@ export default function SorteoCuponesBatchPrintClient({
                           "—"
                         )}
                       </td>
+                      <SorteoCuponesAnularCell
+                        entradaId={r.entrada_id}
+                        numeroOrden={r.numero_orden}
+                        nombreParticipante={r.nombre_participante}
+                        cantidadBoletos={r.cantidad_boletos}
+                        numerosCupon={r.numeros_cupon}
+                        estadoPago={r.estado_pago}
+                      />
                     </tr>
                   );
                 })}

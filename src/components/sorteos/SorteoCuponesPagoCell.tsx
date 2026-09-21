@@ -24,6 +24,9 @@ function badgeClasses(estado: string): string {
   if (estado === "pendiente") {
     return `${base} bg-amber-100 text-amber-900 border border-amber-200`;
   }
+  if (estado === "anulado") {
+    return `${base} bg-slate-200 text-slate-600 border border-slate-300`;
+  }
   return `${base} bg-slate-100 text-slate-700 border border-slate-200`;
 }
 
@@ -33,6 +36,7 @@ function labelForColumn(estado: string): string {
   if (estado === "pendiente") return "Pendiente";
   if (estado === "confirmado") return "Aprobado";
   if (estado === "rechazado") return "Rechazado";
+  if (estado === "anulado") return "Anulada";
   return estado;
 }
 

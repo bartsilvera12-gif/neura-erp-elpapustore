@@ -18,7 +18,13 @@ export type SorteoConversacionEstado =
   | "cancelled"
   | "closed_no_response";
 
-export type SorteoEntradaEstadoPago = "pendiente" | "pendiente_revision" | "confirmado" | "rechazado";
+/** `anulado`: venta dada de baja — sus cupones no participan y el cupo del sorteo se liberó. */
+export type SorteoEntradaEstadoPago =
+  | "pendiente"
+  | "pendiente_revision"
+  | "confirmado"
+  | "rechazado"
+  | "anulado";
 
 export interface Sorteo {
   id: string;
