@@ -1,18 +1,24 @@
 -- =============================================================================
 -- Orden 6434: corregir el teléfono impreso y regenerar la boleta.
 --
--- Correr UN BLOQUE POR VEZ. Cada bloque es una sola sentencia.
--- El intento anterior sobre esta orden se cortó por el error de `updated_at`, así que lo más
--- probable es que siga sin corregir.
+-- Correr UN BLOQUE POR VEZ. Cada bloque es una sola sentencia — seleccionála y ejecutala sola.
+-- No hay nada que completar a mano: la entrada se identifica por número de orden + la línea de
+-- WhatsApp del comprador que reclamó (595984462823).
+--
+-- `numero_orden` NO identifica una fila por sí solo: es un contador por sorteo
+-- (`sorteos.ultimo_numero_orden`) y el mismo número existe en varios sorteos. Sumarle el
+-- WhatsApp deja una sola fila. El bloque 1 lo confirma antes de escribir nada.
 -- =============================================================================
 
 
 -- #############################################################################
--- BLOQUE 1 — Encontrar la entrada. No escribe.
+-- BLOQUE 1 — Ver la entrada. No escribe.
 --
--- `numero_orden` se repite entre sorteos (el contador es por sorteo), así que esto puede
--- devolver varias filas. Elegí la del comprador que reclamó —la del WhatsApp 595984462823—
--- y copiá su `entrada_id`.
+-- Tiene que devolver UNA fila. Si devuelve más de una (el mismo comprador con el número 6434
+-- en dos sorteos), no corras el bloque 2: avisame y lo acotamos por sorteo.
+--
+-- `telefono_declarado_en_el_bot` es lo que cargó la persona; `campo_donde_lo_guardo`, el
+-- save_as_field exacto del nodo del flujo.
 -- #############################################################################
 SELECT
   e.id                AS entrada_id,
@@ -41,16 +47,18 @@ LEFT JOIN LATERAL (
   ORDER BY fd.created_at DESC
   LIMIT 1
 ) decl ON true
-WHERE e.numero_orden = 6434;
+WHERE e.numero_orden = 6434
+  AND e.whatsapp_numero = '595984462823';
 
 
 -- #############################################################################
--- BLOQUE 2 — Corregir el teléfono. Pegá el entrada_id del bloque 1.
--- El RETURNING tiene que mostrar 0973592372 en telefono_contacto.
+-- BLOQUE 2 — Corregir el teléfono.
+-- El RETURNING tiene que mostrar UNA fila con 0973592372 en telefono_contacto.
 -- #############################################################################
 UPDATE elpapustore_erp.sorteo_entradas
    SET telefono_contacto = '0973592372'
- WHERE id = 'PEGAR-ENTRADA-ID'::uuid
+ WHERE numero_orden = 6434
+   AND whatsapp_numero = '595984462823'
 RETURNING id, numero_orden, nombre_participante, whatsapp_numero, telefono_contacto;
 
 
@@ -61,7 +69,8 @@ RETURNING id, numero_orden, nombre_participante, whatsapp_numero, telefono_conta
 UPDATE elpapustore_erp.clientes c
    SET telefono_secundario = e.telefono_contacto
   FROM elpapustore_erp.sorteo_entradas e
- WHERE e.id = 'PEGAR-ENTRADA-ID'::uuid
+ WHERE e.numero_orden = 6434
+   AND e.whatsapp_numero = '595984462823'
    AND c.id = e.cliente_id
    AND e.telefono_contacto IS NOT NULL
 RETURNING c.id, c.nombre, c.telefono AS whatsapp, c.telefono_secundario AS celular_declarado;
@@ -71,21 +80,23 @@ RETURNING c.id, c.nombre, c.telefono AS whatsapp, c.telefono_secundario AS celul
 -- BLOQUE 4 — El ticket a regenerar.
 --
 -- Con el `ticket_id` que devuelve: Panel → Sorteos → Tickets → buscar la orden 6434 →
--- "Regenerar" (nueva revisión del PNG, NO reenvía nada) → "Ver" abre la imagen en una pestaña
--- nueva → botón derecho → Guardar imagen como... Esa es la que le mandás por WhatsApp.
+-- "Regenerar" (nueva revisión del PNG, NO reenvía nada al cliente) → "Ver" abre la imagen en
+-- una pestaña nueva → botón derecho → Guardar imagen como... Esa es la que mandás por WhatsApp.
 --
--- Antes de regenerar, confirmá que el deploy de Vercel con el fix ya terminó: si no, el PNG
--- se rehace igual de mal.
+-- Antes de regenerar, confirmá que terminó el deploy de Vercel con el fix: si no, el PNG se
+-- rehace igual de mal y hay que repetirlo.
 -- #############################################################################
 SELECT d.id AS ticket_id, d.status, d.template_revision, d.is_current, d.storage_path, d.created_at
   FROM elpapustore_erp.sorteo_ticket_deliveries d
- WHERE d.entrada_id = 'PEGAR-ENTRADA-ID'::uuid
+  JOIN elpapustore_erp.sorteo_entradas e ON e.id = d.entrada_id
+ WHERE e.numero_orden = 6434
+   AND e.whatsapp_numero = '595984462823'
  ORDER BY d.template_revision DESC;
 
 
 -- #############################################################################
 -- BLOQUE 5 — Verificación, después de regenerar.
--- `template_revision` tiene que haber subido y `is_current` marcar la revisión nueva.
+-- `telefono_impreso` tiene que decir 0973592372 y `template_revision` haber subido.
 -- #############################################################################
 SELECT
   e.numero_orden,
@@ -98,5 +109,6 @@ SELECT
   d.created_at         AS png_generado
 FROM elpapustore_erp.sorteo_entradas e
 JOIN elpapustore_erp.sorteo_ticket_deliveries d ON d.entrada_id = e.id
-WHERE e.id = 'PEGAR-ENTRADA-ID'::uuid
+WHERE e.numero_orden = 6434
+  AND e.whatsapp_numero = '595984462823'
 ORDER BY d.template_revision DESC;
