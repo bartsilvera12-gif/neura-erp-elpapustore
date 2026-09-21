@@ -19,6 +19,7 @@
     "db:apply-comprobante-monto-migration": "tsx scripts/apply-comprobante-monto-vs-flujo-migration.ts",
     "db:apply-comprobante-bank-validation-migration": "tsx scripts/apply-comprobante-bank-validation-migration.ts",
     "db:apply-sorteo-revendedores-migration": "tsx scripts/apply-sorteo-revendedores-migration.ts",
+    "qa:sorteo-telefono-boleta": "tsx --conditions=react-server scripts/qa-sorteo-telefono-boleta-unit.ts",
     "verify:sorteo-integridad": "tsx scripts/verify-sorteo-integridad-nombre-monto.ts",
     "verify:flow-sessions": "tsx scripts/verify-flow-session-isolation.ts",
     "db:migrate-sifen-cert-password": "tsx scripts/migrate-sifen-certificado-password-to-encrypted.ts",

@@ -30,6 +30,8 @@ export type DirectPgSorteoInput = {
   nombreCompleto: string;
   cedula: string;
   ciudad: string;
+  /** Celular declarado por el comprador en el flujo (distinto del WhatsApp remitente). */
+  telefonoContacto: string;
   cantidadBoletos: number;
   comprobanteUrl: string;
   validadoPor: string;
@@ -267,6 +269,7 @@ export async function ensureSorteoOrderViaDirectPostgres(
     let clienteId: string | null = null;
     const ce = input.cedula.trim();
     const wa = input.whatsappNumero.trim();
+    const telContacto = input.telefonoContacto.trim();
 
     const deletedClause = cliCols.has("deleted_at") ? "AND deleted_at IS NULL" : "";
 
@@ -282,13 +285,54 @@ export async function ensureSorteoOrderViaDirectPostgres(
     );
     if (findCli.rows[0]) {
       clienteId = findCli.rows[0].id;
+      /**
+       * Cliente que ya existía de compras anteriores: se le completa el celular declarado si
+       * todavía no tenía. No se pisa uno cargado antes — eso es decisión del panel, no del bot.
+       */
+      if (telContacto && cliCols.has("telefono_secundario")) {
+        await client.query(
+          `UPDATE ${qsch}.clientes
+              SET telefono_secundario = $1
+            WHERE id = $2
+              AND empresa_id = $3
+              AND coalesce(trim(telefono_secundario), '') = ''`,
+          [telContacto, clienteId, input.empresaId]
+        );
+      }
     } else {
+      /**
+       * `telefono` sigue siendo el WhatsApp: es la clave con la que el bot reconoce al
+       * recomprador (`fetchIdentityRecallCliente` busca por ahí). El celular declarado va a
+       * `telefono_secundario`, cuando el schema del tenant tiene esa columna.
+       */
+      const guardaTelSecundario = cliCols.has("telefono_secundario") && Boolean(telContacto);
+      const colsCli = [
+        "empresa_id",
+        "tipo_cliente",
+        "nombre_contacto",
+        "nombre",
+        "documento",
+        "telefono",
+        "ciudad",
+        "origen",
+        ...(guardaTelSecundario ? ["telefono_secundario"] : []),
+      ];
+      const valsCli: unknown[] = [
+        input.empresaId,
+        "persona",
+        input.nombreCompleto,
+        input.nombreCompleto,
+        ce || null,
+        wa,
+        input.ciudad.trim() || null,
+        "SORTEO_CHAT",
+        ...(guardaTelSecundario ? [telContacto] : []),
+      ];
       const insCli = await client.query<{ id: string }>(
-        `INSERT INTO ${qsch}.clientes (
-           empresa_id, tipo_cliente, nombre_contacto, nombre, documento, telefono, ciudad, origen
-         ) VALUES ($1, 'persona', $2, $2, $3, $4, $5, 'SORTEO_CHAT')
+        `INSERT INTO ${qsch}.clientes (${colsCli.map((c) => `"${c}"`).join(", ")})
+         VALUES (${colsCli.map((_, i) => `$${i + 1}`).join(", ")})
          RETURNING id`,
-        [input.empresaId, input.nombreCompleto, ce || null, wa, input.ciudad.trim() || null]
+        valsCli
       );
       clienteId = insCli.rows[0]?.id ?? null;
     }
@@ -302,6 +346,7 @@ export async function ensureSorteoOrderViaDirectPostgres(
       conversacion_id: null,
       cliente_id: clienteId,
       whatsapp_numero: wa,
+      telefono_contacto: telContacto || null,
       nombre_participante: input.nombreCompleto.trim(),
       documento: ce || null,
       cantidad_boletos: qty,

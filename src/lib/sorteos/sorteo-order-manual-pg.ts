@@ -274,6 +274,12 @@ export async function createSorteoManualCashSaleViaDirectPostgres(
       conversacion_id: null,
       cliente_id: clienteId,
       whatsapp_numero: wa,
+      /**
+       * En la venta manual el teléfono lo tipea el operador desde lo que dijo el comprador:
+       * es el número declarado. Se guarda tal cual se cargó (sin normalizar a dígitos) porque
+       * es el que se imprime en la boleta.
+       */
+      telefono_contacto: input.telefono.trim() || null,
       nombre_participante: nombreCompleto,
       documento: ce || null,
       cantidad_boletos: qty,

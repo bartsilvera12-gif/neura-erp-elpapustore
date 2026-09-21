@@ -61,6 +61,28 @@ export async function buildOrderResultFromEntradaId(
   };
 }
 
+/**
+ * Celular declarado de la orden. Consulta aparte y tolerante a fallos: `telefono_contacto`
+ * es una columna nueva, y si un schema todavía no la tiene el ticket debe seguir saliendo
+ * (con el WhatsApp de respaldo) en vez de romper la lectura completa de la entrada.
+ */
+async function fetchTelefonoContactoTolerant(
+  sb: AppSupabaseClient,
+  entradaId: string
+): Promise<string> {
+  try {
+    const { data, error } = await sb
+      .from("sorteo_entradas")
+      .select("telefono_contacto")
+      .eq("id", entradaId)
+      .maybeSingle();
+    if (error) return "";
+    return String((data as { telefono_contacto?: string | null } | null)?.telefono_contacto ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
 export async function flowDataStubFromEntrada(
   sb: AppSupabaseClient,
   entradaId: string
@@ -70,12 +92,19 @@ export async function flowDataStubFromEntrada(
     .select("nombre_participante, documento, whatsapp_numero")
     .eq("id", entradaId)
     .maybeSingle();
-  const r = ent as { nombre_participante?: string; documento?: string | null; whatsapp_numero?: string } | null;
+  const r = ent as {
+    nombre_participante?: string;
+    documento?: string | null;
+    whatsapp_numero?: string;
+  } | null;
+  /** El declarado manda; el WhatsApp queda de respaldo para órdenes viejas sin ese dato. */
+  const tel =
+    (await fetchTelefonoContactoTolerant(sb, entradaId)) || (r?.whatsapp_numero ?? "").trim();
   return {
     nombre_completo: (r?.nombre_participante ?? "").trim(),
     documento: (r?.documento ?? "").trim(),
-    telefono: (r?.whatsapp_numero ?? "").trim(),
-    celular: (r?.whatsapp_numero ?? "").trim(),
+    telefono: tel,
+    celular: tel,
   };
 }
 
@@ -83,7 +112,10 @@ export async function flowDataStubFromEntrada(
 export type SorteoTicketEntradaDbSnapshot = {
   clienteNombre: string;
   documento: string;
+  /** WhatsApp remitente (`sorteo_entradas.whatsapp_numero`): sólo respaldo para el PNG. */
   telefono: string;
+  /** Celular declarado y confirmado por el comprador (`sorteo_entradas.telefono_contacto`). */
+  telefonoContacto: string;
   numeroOrdenStr: string;
   cupones: string[];
   sorteoNombre: string;
@@ -140,6 +172,7 @@ export async function loadSorteoTicketEntradaDbSnapshot(
     clienteNombre: String(enc.nombre_participante ?? "").trim(),
     documento: String(enc.documento ?? "").trim(),
     telefono: String(enc.whatsapp_numero ?? "").trim(),
+    telefonoContacto: await fetchTelefonoContactoTolerant(sb, entradaId),
     numeroOrdenStr,
     cupones,
     sorteoNombre: String((sorteo as { nombre?: string } | null)?.nombre ?? "").trim(),

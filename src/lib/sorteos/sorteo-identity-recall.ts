@@ -89,6 +89,14 @@ export function buildIdentityRecallFlowDataWrites(
     { field_name: "ciudad", field_value: cliente.ciudad.trim() },
   ];
   /**
+   * Sólo si hay un celular DECLARADO en compras anteriores. Si no lo hay, el slot queda vacío
+   * a propósito: el flujo vuelve a pedirlo, en vez de dar por confirmado el número de WhatsApp
+   * desde el que escribe (que es justamente lo que terminaba impreso en la boleta por error).
+   */
+  if (cliente.telefono.trim()) {
+    rows.push({ field_name: "telefono", field_value: cliente.telefono.trim() });
+  }
+  /**
    * `nombre_completo` se recalcula desde nombre + apellido en el parser, pero si quedó un valor
    * viejo de otra sesión gana por precedencia. Lo reescribimos con el confirmado.
    */
@@ -98,6 +106,8 @@ export function buildIdentityRecallFlowDataWrites(
 
 /**
  * Slots de identidad (con todos sus alias) que el "No, ingresar nuevo" vacía.
+ * Incluye el teléfono de contacto: si la compra es para otra persona, su celular tampoco
+ * puede quedar heredado del comprador anterior.
  * Espeja los buckets de `bucketForSaveField`: si un alias queda con valor, el gate de
  * completitud lo toma como identidad cargada.
  */
@@ -126,6 +136,26 @@ export const IDENTITY_RECALL_CLEAR_FIELDS: readonly string[] = [
   "localidad",
   "ubicacion",
   "ubicación",
+  // teléfono de contacto (mismos alias que el bucket `telefono` del gate de completitud)
+  "telefono",
+  "teléfono",
+  "telefono_contacto",
+  "telefono_celular",
+  "numero_telefono",
+  "nro_telefono",
+  "celular",
+  "numero_celular",
+  "número_celular",
+  "nro_celular",
+  "num_celular",
+  "movil",
+  "móvil",
+  "numero_contacto",
+  "número_contacto",
+  "whatsapp",
+  "numero_whatsapp",
+  "phone",
+  "mobile",
   // snapshot de lo mostrado: si el comprador rechaza, no debe sobrevivir para promoverse después
   "recall_snap_datos",
   // y la marca de confirmación: sin ella no se saltea ningún paso de captura
