@@ -17,7 +17,16 @@
 SELECT
   e.node_code,
   e.event_type,
-  left(coalesce(e.payload ->> 'error', e.payload ->> 'error_message', ''), 160) AS error,
+  left(
+    coalesce(
+      substring(e.payload ->> 'error' from '<title[^>]*>([^<]*)</title>'),
+      substring(e.payload ->> 'error_message' from '<title[^>]*>([^<]*)</title>'),
+      e.payload ->> 'error',
+      e.payload ->> 'error_message',
+      ''
+    ),
+    160
+  ) AS error,
   count(*) AS veces,
   min(e.created_at) AS primera,
   max(e.created_at) AS ultima
@@ -26,6 +35,7 @@ WHERE e.flow_code = 'Papu_store'
   AND e.created_at >= now() - interval '14 days'
   AND e.event_type IN (
     'present_failed',
+    'flow_send_failed',
     'manual_current_node_resend_failed',
     'sorteo_manual_approval_resume_send_failed'
   )
