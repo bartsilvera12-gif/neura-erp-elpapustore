@@ -81,7 +81,7 @@ export async function POST(
         {
           ok: false,
           error:
-            "La conversación está en modo humano. Confirmá si querés reenviar igualmente el mensaje del paso actual del bot.",
+            "La conversación está en modo humano. Si reenviás el paso actual, la conversación vuelve al bot para que procese la respuesta del cliente.",
           needs_human_override_confirmation: true,
         },
         { status: 409 }
@@ -116,8 +116,43 @@ export async function POST(
       );
     }
 
+    /**
+     * Reenviar la pregunta del bot en modo humano sin devolverle la conversación al bot dejaba al
+     * cliente trabado justo después de "destrabarlo": la pregunta le llegaba, pero su respuesta
+     * la ignoraba el motor (`ignored_not_bot_mode`) y nadie la procesaba. Si el operador confirmó
+     * el reenvío, la conversación vuelve al bot ANTES de enviar —así una respuesta inmediata no se
+     * pierde— y si el envío falla se restaura el modo humano como estaba.
+     */
+    const prevFlowStatus = (conv as { flow_status?: string | null }).flow_status ?? null;
+    const returnedToBot = humanTaken || String(prevFlowStatus ?? "").trim().toLowerCase() === "human";
+    if (returnedToBot) {
+      const { error: botErr } = await supabase
+        .from("chat_conversations")
+        .update({ flow_status: "bot", human_taken_over: false, updated_at: new Date().toISOString() })
+        .eq("id", conversationId)
+        .eq("empresa_id", auth.empresa_id);
+      if (botErr) {
+        return NextResponse.json(
+          { ok: false, error: `No se pudo devolver la conversación al bot: ${botErr.message}` },
+          { status: 400 }
+        );
+      }
+    }
+
     const engine = createFlowEngine({ supabase });
     const sent = await engine.sendCurrentFlowNode({ conversationId });
+
+    if (!sent.ok && returnedToBot) {
+      await supabase
+        .from("chat_conversations")
+        .update({
+          flow_status: prevFlowStatus ?? "human",
+          human_taken_over: humanTaken,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", conversationId)
+        .eq("empresa_id", auth.empresa_id);
+    }
 
     const baseAudit = {
       source: "inbox" as const,
@@ -128,6 +163,7 @@ export async function POST(
       node_code: nodeCode,
       operator_user_id: auth.user.id,
       operator_label: (auth.nombre ?? auth.user.email ?? "").trim() || null,
+      returned_to_bot: returnedToBot,
     };
 
     if (!sent.ok) {

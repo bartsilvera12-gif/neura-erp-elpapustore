@@ -437,6 +437,44 @@ function waMessageIdFromRawPayload(rawPayload: Record<string, unknown>): string 
   return typeof raw === "string" ? raw.trim() : "";
 }
 
+/**
+ * Una línea por transición del flujo, siempre con la misma forma, para poder reconstruir en los
+ * logs de Vercel por qué una conversación se cortó o cambió de campo: qué nodo esperaba el
+ * puntero, qué pregunta tenía el cliente en pantalla, qué llegó, a dónde se fue y con qué
+ * resultado. Grep: `[flow-state]`.
+ *
+ * El texto se registra acortado: alcanza para reconocer "Pedro" vs "0981..." sin volcar
+ * mensajes largos del cliente en los logs.
+ */
+export function logFlowStateTransition(t: {
+  conversationId: string;
+  flowSessionId: string | null;
+  expectedNode: string | null;
+  expectedField: string | null;
+  lastQuestionSent: string | null;
+  textValue: string | null;
+  nextNode: string | null;
+  result: string;
+}): void {
+  const tv = t.textValue ?? null;
+  console.info("[flow-state]", {
+    ts: new Date().toISOString(),
+    conversation_id: t.conversationId,
+    flow_session_id: t.flowSessionId,
+    expected_node: t.expectedNode,
+    expected_field: t.expectedField,
+    last_question_sent: t.lastQuestionSent,
+    pointer_matches_screen:
+      t.lastQuestionSent == null || t.expectedNode == null
+        ? null
+        : t.lastQuestionSent === t.expectedNode,
+    received_preview: tv == null ? null : tv.length > 40 ? `${tv.slice(0, 40)}…` : tv,
+    received_len: tv == null ? null : tv.length,
+    next_node: t.nextNode,
+    result: t.result,
+  });
+}
+
 /** Evento marcador: deja constancia de que este mensaje ya pasó por el motor de flujo. */
 const INTERACTIVE_PROCESSED_EVENT = "interactive_reply_processed" as const;
 
@@ -727,6 +765,47 @@ export function createFlowEngine(ctx: FlowEngineContext) {
     return (data as { activo?: boolean }).activo !== false;
   }
 
+  /**
+   * Último nodo que el bot le ENVIÓ al cliente en esta sesión: la pregunta que el cliente tiene
+   * en pantalla y que cree estar contestando. `null` si no se envió nada todavía.
+   */
+  async function getLastNodeSentInSession(
+    conversationId: string,
+    flowCode: string,
+    flowSessionId: string | null | undefined
+  ): Promise<string | null> {
+    const sid = flowSessionId?.trim();
+    if (!sid) return null;
+    const { data, error } = await supabase
+      .from("chat_flow_events")
+      .select("node_code, created_at")
+      .eq("conversation_id", conversationId)
+      .eq("flow_code", flowCode)
+      .eq("flow_session_id", sid)
+      .eq("event_type", "node_sent")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      console.error("[flow-engine] getLastNodeSentInSession:", error.message);
+      return null;
+    }
+    const code = (data as { node_code?: string | null } | null)?.node_code;
+    return typeof code === "string" && code.trim() ? code.trim() : null;
+  }
+
+  /**
+   * ¿El nodo actual es la pregunta que el cliente tiene en pantalla?
+   *
+   * Antes bastaba con que el nodo se hubiera enviado ALGUNA VEZ en la sesión. Eso fallaba cuando
+   * el puntero volvía a un nodo ya preguntado (rebobinado del gate de completitud, continuación
+   * manual): el motor lo daba por presentado, no repetía la pregunta y la conversación quedaba
+   * esperando una respuesta que el cliente no sabía que le pedían —p. ej. la cédula—.
+   *
+   * Ahora cuenta como presentado sólo si es el ÚLTIMO nodo enviado de la sesión. Un auto-encadenado
+   * (media → texto) deja como último el nodo donde descansa el puntero, así que no cambia nada
+   * para el camino normal.
+   */
   async function wasNodeSentForCurrentStep(
     conversationId: string,
     flowCode: string,
@@ -742,21 +821,8 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       });
       return false;
     }
-    const { data, error } = await supabase
-      .from("chat_flow_events")
-      .select("id")
-      .eq("conversation_id", conversationId)
-      .eq("flow_code", flowCode)
-      .eq("flow_session_id", sid)
-      .eq("node_code", nodeCode)
-      .eq("event_type", "node_sent")
-      .limit(1)
-      .maybeSingle();
-    if (error) {
-      console.error("[flow-engine] wasNodeSentForCurrentStep:", error.message);
-      return false;
-    }
-    return Boolean((data as { id?: string } | null)?.id);
+    const last = await getLastNodeSentInSession(conversationId, flowCode, sid);
+    return last != null && last === nodeCode.trim();
   }
 
   /**
@@ -1389,6 +1455,32 @@ export function createFlowEngine(ctx: FlowEngineContext) {
   }
 
   /**
+   * Avance con compare-and-set: mueve el puntero SÓLO si sigue en `expectedCurrentNode`.
+   * `claimed: false` significa que otro handler ya movió el paso (mensaje duplicado de Meta o
+   * ráfaga del cliente procesándose en paralelo); quien pierde no debe guardar ni enviar nada.
+   */
+  async function claimConversationNodeTransition(
+    params: AdvanceConversationParams & { expectedCurrentNode: string }
+  ): Promise<{ ok: boolean; claimed: boolean; error?: string }> {
+    const { data, error } = await supabase
+      .from("chat_conversations")
+      .update({
+        flow_code: params.flowCode,
+        flow_current_node: params.nextNodeCode,
+        flow_status: "bot",
+        human_taken_over: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", params.conversationId)
+      .eq("empresa_id", params.empresaId)
+      .eq("flow_current_node", params.expectedCurrentNode)
+      .select("id");
+    if (error) return { ok: false, claimed: false, error: error.message };
+    const rows = Array.isArray(data) ? data : data ? [data] : [];
+    return { ok: true, claimed: rows.length > 0 };
+  }
+
+  /**
    * Cierra la sesión de flujo cuando se acaba de enviar el nodo FINAL de compra de sorteo
    * (p. ej. `compra_realizada`, sin next_node_code). Sin esto, la conversación queda "pegada"
    * en el nodo final con sesión `active`, y un mensaje/botón posterior del cliente recurrente
@@ -1739,6 +1831,17 @@ export function createFlowEngine(ctx: FlowEngineContext) {
           next_node_code: ptrResolved.effectiveNodeCode,
           reason: "missing_capture_before_current_step",
         },
+      });
+      /** El rebobinado es la transición que "cambia de campo": queda en la misma traza. */
+      logFlowStateTransition({
+        conversationId: state.id,
+        flowSessionId: sidGate,
+        expectedNode: state.flow_current_node.trim(),
+        expectedField: nodeFetched.save_as_field?.trim() || null,
+        lastQuestionSent: null,
+        textValue: null,
+        nextNode: ptrResolved.effectiveNodeCode,
+        result: `pointer_rewound_missing:${(descPtr?.missing_fields ?? []).join(",")}`,
       });
       return sendCurrentFlowNode({ ...params, __autoHop: currentHop });
     }
@@ -3790,6 +3893,114 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       };
     }
 
+    const sfCapture = currentNode.save_as_field.trim();
+    const expectedNode = currentNode.node_code.trim();
+
+    /**
+     * Qué pregunta tiene el cliente en pantalla. Si no es el nodo del puntero, este texto contesta
+     * OTRA cosa: guardarlo acá es exactamente el "ciudad terminó guardada como teléfono".
+     * Sólo pasa si algo movió el puntero entre la presentación y este handler (otro mensaje
+     * procesándose en paralelo): el otro handler es dueño del paso, así que éste no guarda ni envía.
+     */
+    const lastQuestionSent = await getLastNodeSentInSession(state.id, state.flow_code, textFlowSid);
+    if (lastQuestionSent && lastQuestionSent !== expectedNode) {
+      logFlowStateTransition({
+        conversationId: state.id,
+        flowSessionId: textFlowSid,
+        expectedNode,
+        expectedField: sfCapture,
+        lastQuestionSent,
+        textValue,
+        nextNode: null,
+        result: "ignored_pointer_not_on_screen",
+      });
+      await insertFlowEvent({
+        empresaId: state.empresa_id,
+        conversationId: state.id,
+        flowCode: state.flow_code,
+        nodeCode: expectedNode,
+        flowSessionId: textFlowSid,
+        eventType: "capture_pointer_mismatch",
+        payload: {
+          expected_node: expectedNode,
+          expected_field: sfCapture,
+          last_question_sent: lastQuestionSent,
+          text_value: textValue,
+          wa_message_id: waMessageIdFromRawPayload(params.rawPayload),
+        },
+      });
+      return { ok: true, status: "ignored_pointer_not_on_screen" };
+    }
+
+    /**
+     * Reclamo del paso ANTES de guardar. El próximo nodo se calcula con la respuesta en memoria
+     * (`mergeFlowVars`) y el puntero se mueve con un UPDATE condicional: sólo avanza quien lo
+     * encuentra todavía en `expectedNode`.
+     *
+     * Por qué: el webhook de Meta a veces entrega el mismo mensaje dos veces en paralelo, y los
+     * clientes mandan ráfagas ("Pedro" / "López"). Sin esto, dos handlers leían el mismo puntero,
+     * los dos avanzaban y el segundo guardaba su texto en el campo SIGUIENTE: Pedro quedaba como
+     * apellido y todo el resto corrido un lugar. El que pierde el reclamo no guarda ni envía nada.
+     *
+     * Si el guardado fallara después de ganar el reclamo, el puntero quedó adelantado sin el dato:
+     * el gate de completitud lo rebobina al enviar el próximo nodo, así que se autocorrige.
+     */
+    let nextTxt: string | null = null;
+    if (currentNode.next_node_code?.trim()) {
+      const txtGate = await resolveProposedNextWithCompletenessGate({
+        empresaId: state.empresa_id,
+        conversationId: state.id,
+        flowCode: state.flow_code,
+        flowSessionId: textFlowSid,
+        proposedNextCode: currentNode.next_node_code.trim(),
+        mergeFlowVars: { [sfCapture]: textValue },
+        gateReason: "text_captured",
+      });
+      nextTxt = txtGate.effectiveNext;
+
+      const claim = await claimConversationNodeTransition({
+        conversationId: state.id,
+        empresaId: state.empresa_id,
+        flowCode: state.flow_code,
+        nextNodeCode: nextTxt,
+        expectedCurrentNode: expectedNode,
+      });
+      if (!claim.ok) {
+        return {
+          ok: false,
+          status: "advance_failed",
+          error: claim.error ?? "No se pudo avanzar al siguiente nodo",
+        };
+      }
+      if (!claim.claimed) {
+        logFlowStateTransition({
+          conversationId: state.id,
+          flowSessionId: textFlowSid,
+          expectedNode,
+          expectedField: sfCapture,
+          lastQuestionSent,
+          textValue,
+          nextNode: nextTxt,
+          result: "lost_race_not_saved",
+        });
+        await insertFlowEvent({
+          empresaId: state.empresa_id,
+          conversationId: state.id,
+          flowCode: state.flow_code,
+          nodeCode: expectedNode,
+          flowSessionId: textFlowSid,
+          eventType: "text_reply_lost_race",
+          payload: {
+            expected_node: expectedNode,
+            expected_field: sfCapture,
+            text_value: textValue,
+            wa_message_id: waMessageIdFromRawPayload(params.rawPayload),
+          },
+        });
+        return { ok: true, status: "ignored_concurrent_reply" };
+      }
+    }
+
     if (currentNode.save_as_field) {
       const { error: dataErr } = await supabase
         .from("chat_flow_data")
@@ -3805,6 +4016,29 @@ export function createFlowEngine(ctx: FlowEngineContext) {
           { onConflict: "flow_session_id,field_name" }
         );
       if (dataErr) {
+        /**
+         * El reclamo ya movió el puntero: sin volverlo atrás, el cliente quedaría sin pregunta y
+         * con el paso adelantado sin su dato. Mismo CAS al revés, así no pisa a otro handler.
+         */
+        if (nextTxt) {
+          await claimConversationNodeTransition({
+            conversationId: state.id,
+            empresaId: state.empresa_id,
+            flowCode: state.flow_code,
+            nextNodeCode: expectedNode,
+            expectedCurrentNode: nextTxt,
+          });
+        }
+        logFlowStateTransition({
+          conversationId: state.id,
+          flowSessionId: textFlowSid,
+          expectedNode,
+          expectedField: sfCapture,
+          lastQuestionSent,
+          textValue,
+          nextNode: nextTxt,
+          result: `save_failed_pointer_rolled_back:${dataErr.message}`,
+        });
         return { ok: false, status: "save_text_failed", error: dataErr.message };
       }
       flowTrace("flow_data_write", {
@@ -3883,19 +4117,20 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       });
     }
 
-    if (!currentNode.next_node_code) {
+    logFlowStateTransition({
+      conversationId: state.id,
+      flowSessionId: textFlowSid,
+      expectedNode,
+      expectedField: sfCapture,
+      lastQuestionSent,
+      textValue,
+      nextNode: nextTxt,
+      result: nextTxt ? "captured_advanced" : "captured_no_next_node",
+    });
+
+    if (!nextTxt) {
       return { ok: true, status: "captured_no_next_node" };
     }
-
-    const txtGate = await resolveProposedNextWithCompletenessGate({
-      empresaId: state.empresa_id,
-      conversationId: state.id,
-      flowCode: state.flow_code,
-      flowSessionId: textFlowSid,
-      proposedNextCode: currentNode.next_node_code.trim(),
-      gateReason: "text_captured",
-    });
-    const nextTxt = txtGate.effectiveNext;
 
     console.info("[flow-engine] text captured advance", {
       conversationId: state.id,
@@ -3903,20 +4138,6 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       saveAsField: currentNode.save_as_field ?? null,
       nextNodeCode: nextTxt,
     });
-
-    const adv = await advanceConversationToNode({
-      conversationId: state.id,
-      empresaId: state.empresa_id,
-      flowCode: state.flow_code,
-      nextNodeCode: nextTxt,
-    });
-    if (!adv.ok) {
-      return {
-        ok: false,
-        status: "advance_failed",
-        error: adv.error ?? "No se pudo avanzar al siguiente nodo",
-      };
-    }
 
     await insertFlowEvent({
       empresaId: state.empresa_id,
@@ -3934,6 +4155,16 @@ export function createFlowEngine(ctx: FlowEngineContext) {
 
     const sent = await sendCurrentFlowNode({ conversationId: state.id });
     if (!sent.ok) {
+      logFlowStateTransition({
+        conversationId: state.id,
+        flowSessionId: textFlowSid,
+        expectedNode: nextTxt,
+        expectedField: null,
+        lastQuestionSent: expectedNode,
+        textValue: null,
+        nextNode: nextTxt,
+        result: `send_next_failed:${sent.error ?? "unknown"}`,
+      });
       return { ok: false, status: "send_next_node_failed", error: sent.error };
     }
 

@@ -2,7 +2,7 @@ import {
   provisionChannelFromWebhookEnv,
   type WebhookProvisionEnv,
 } from "@/lib/chat/channel-provision";
-import { createFlowEngine } from "@/lib/chat/flow-engine-service";
+import { createFlowEngine, logFlowStateTransition } from "@/lib/chat/flow-engine-service";
 import { flowTrace } from "@/lib/chat/flow-trace-log";
 import { persistInboundChatMessageAndBump } from "@/lib/chat/incoming-message-service";
 import { isSingleClientMode } from "@/lib/instance/single-client";
@@ -1235,6 +1235,21 @@ export async function processInboundWebhookValue(
               waMessageId: waMid,
               messageRowId: inboundRowId,
             });
+          } else if (persistInbound.duplicate && !mustRetryInboundRoutingDespiteDedupe) {
+            /**
+             * Perdimos la carrera del insert contra OTRA entrega del mismo mensaje (Meta a veces
+             * entrega en paralelo). Mismo criterio que el dedupe de arriba para reintentos
+             * secuenciales: un texto ya procesado no vuelve a entrar al motor de flujo. Antes se
+             * seguía de largo y el mismo "Pedro" se procesaba dos veces: la segunda copia caía en
+             * el campo siguiente y corría toda la carga de datos un lugar.
+             */
+            console.info(logW, "inbound_message_duplicate_race_skipped", {
+              conversationId,
+              waMessageId: waMid,
+              message_type,
+            });
+            skipped += 1;
+            continue;
           } else if (persistInbound.duplicate) {
             const { data: dupRow } = await supabase
               .from("chat_messages")
@@ -1705,18 +1720,38 @@ export async function processInboundWebhookValue(
         if (!interactiveInboundMetaId) {
           if (message_type === "text") {
             const skipAfterRestartKeyword = restartKeywordMatch && restartedThisMessage;
-            const skipBecauseNonCapturePresent =
-              presentResult && presentResult.presentedNow && !presentResult.acceptsInboundTextAsCapture;
+            /**
+             * Si el nodo actual se ACABA de presentar con este mismo mensaje, el cliente escribió
+             * este texto antes de ver la pregunta: no puede ser su respuesta. Antes esto sólo se
+             * respetaba para nodos que no son de captura; en uno de captura el texto se guardaba
+             * igual en ese campo. Así terminaba el teléfono guardado como ciudad cuando el puntero
+             * había quedado en un nodo sin enviar (envío fallido, continuación manual, rebobinado
+             * del gate). La pregunta ya salió con este envío: la próxima respuesta es la buena.
+             */
+            const skipBecauseJustPresented = Boolean(presentResult && presentResult.presentedNow);
             if (skipAfterRestartKeyword) {
               console.info(logW, "skip_text_flow_handler", {
                 conversationId,
                 reason: "mensaje_usado_como_reinicio_flujo_no_es_captura",
               });
-            } else if (skipBecauseNonCapturePresent) {
+            } else if (skipBecauseJustPresented) {
               console.info(logW, "skip_text_flow_handler", {
                 conversationId,
-                reason:
-                  "Se acaba de enviar la UI del nodo actual (no es captura de texto); el mismo mensaje no se interpreta como dato del flujo",
+                reason: presentResult?.acceptsInboundTextAsCapture
+                  ? "Se acaba de enviar la pregunta del nodo actual; el mensaje es anterior a la pregunta y no se toma como respuesta"
+                  : "Se acaba de enviar la UI del nodo actual (no es captura de texto); el mismo mensaje no se interpreta como dato del flujo",
+              });
+              logFlowStateTransition({
+                conversationId,
+                flowSessionId: null,
+                expectedNode: null,
+                expectedField: null,
+                lastQuestionSent: null,
+                textValue: content,
+                nextNode: null,
+                result: presentResult?.acceptsInboundTextAsCapture
+                  ? "not_captured_question_just_presented"
+                  : "not_captured_non_capture_node_presented",
               });
             } else {
               const textResult = await flowEngine.processTextReply({
