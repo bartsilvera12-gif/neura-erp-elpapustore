@@ -1,4 +1,16 @@
 import { downloadMetaMediaBytes } from "@/lib/chat/meta-media-download";
+import {
+  clientSentAtMsFromRaw,
+  latestQuestionRun,
+  textPredatesQuestion,
+  type NodeSentRow,
+} from "@/lib/chat/flow-answer-timing";
+import {
+  isTransientSendError,
+  SEND_RETRY_DELAYS_MS,
+  summarizeSendError,
+} from "@/lib/chat/flow-send-errors";
+import { restartWhatsappConversationToFlowStart } from "@/lib/chat/resolve-whatsapp-active-flow";
 import { flowTrace, summarizeFlowDataForTrace } from "@/lib/chat/flow-trace-log";
 import {
   COMPROBANTE_BUTTON_IDS,
@@ -774,6 +786,23 @@ export function createFlowEngine(ctx: FlowEngineContext) {
     flowCode: string,
     flowSessionId: string | null | undefined
   ): Promise<string | null> {
+    const last = await getLastQuestionSentInSession(conversationId, flowCode, flowSessionId);
+    return last?.nodeCode ?? null;
+  }
+
+  /**
+   * Igual que `getLastNodeSentInSession`, con los momentos en que salió esa pregunta.
+   *
+   * `firstSentAtMs` es el PRIMER envío de la racha actual de esa misma pregunta: si se reenvió
+   * (botón "Reenviar paso actual", o dos handlers mandándola a la vez), una respuesta escrita
+   * después del primer envío es válida aunque sea anterior al último. Un envío de la misma
+   * pregunta en una visita ANTERIOR (antes de pasar por otro nodo) no cuenta: ahí la racha se corta.
+   */
+  async function getLastQuestionSentInSession(
+    conversationId: string,
+    flowCode: string,
+    flowSessionId: string | null | undefined
+  ): Promise<{ nodeCode: string; sentAtMs: number | null; firstSentAtMs: number | null } | null> {
     const sid = flowSessionId?.trim();
     if (!sid) return null;
     const { data, error } = await supabase
@@ -784,14 +813,12 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       .eq("flow_session_id", sid)
       .eq("event_type", "node_sent")
       .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .limit(10);
     if (error) {
-      console.error("[flow-engine] getLastNodeSentInSession:", error.message);
+      console.error("[flow-engine] getLastQuestionSentInSession:", error.message);
       return null;
     }
-    const code = (data as { node_code?: string | null } | null)?.node_code;
-    return typeof code === "string" && code.trim() ? code.trim() : null;
+    return latestQuestionRun((Array.isArray(data) ? data : []) as NodeSentRow[]);
   }
 
   /**
@@ -1594,7 +1621,7 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         reason: "auto_chain_after_outbound",
       },
     });
-    return sendCurrentFlowNode({
+    return sendCurrentFlowNodeOnce({
       conversationId: state.id,
       __autoHop: currentHop + 1,
       mergeFlowVars,
@@ -1691,7 +1718,56 @@ export function createFlowEngine(ctx: FlowEngineContext) {
    * antes de enviar; si el envío falla aquí, sin este evento la conversación queda silenciosamente
    * bloqueada (P1 2026-05-23). Idempotente: no muta puntero ni datos del flujo.
    */
+  /**
+   * Envía el nodo actual con reintentos ante fallas PASAJERAS (5xx de la base o del proveedor,
+   * red caída, #131000 de Meta). Es la entrada para todo llamador de afuera; la recursión interna
+   * (encadenados, rebobinados) usa `sendCurrentFlowNodeOnce` para que los reintentos no se
+   * multipliquen por nivel.
+   *
+   * Por qué: el primer paso del flujo falló ~47 veces en 14 días por un 5xx pasajero y nadie
+   * reintentaba — el cliente que escribió "hola" quedaba sin respuesta. El reintento sigue desde
+   * donde quedó el puntero: si el primer intento alcanzó a enviar la bienvenida y falló en los
+   * combos, el segundo manda los combos. Lo que va a fallar igual (nodo inexistente, sesión sin
+   * iniciar, ventana de 24 h cerrada) no se reintenta.
+   */
   async function sendCurrentFlowNode(
+    params: SendCurrentNodeParams
+  ): Promise<{ ok: boolean; nodeCode?: string; error?: string }> {
+    let result = await sendCurrentFlowNodeOnce(params);
+    for (
+      let attempt = 1;
+      !result.ok && attempt <= SEND_RETRY_DELAYS_MS.length && isTransientSendError(result.error);
+      attempt++
+    ) {
+      logFlowStateTransition({
+        conversationId: params.conversationId,
+        flowSessionId: null,
+        expectedNode: null,
+        expectedField: null,
+        lastQuestionSent: null,
+        textValue: null,
+        nextNode: null,
+        result: `send_retry_${attempt}:${summarizeSendError(result.error)}`,
+      });
+      await new Promise((r) => setTimeout(r, SEND_RETRY_DELAYS_MS[attempt - 1]));
+      result = await sendCurrentFlowNodeOnce(params);
+      if (result.ok) {
+        logFlowStateTransition({
+          conversationId: params.conversationId,
+          flowSessionId: null,
+          expectedNode: result.nodeCode ?? null,
+          expectedField: null,
+          lastQuestionSent: null,
+          textValue: null,
+          nextNode: result.nodeCode ?? null,
+          result: `send_recovered_after_retry_${attempt}`,
+        });
+      }
+    }
+    return result.ok ? result : { ...result, error: summarizeSendError(result.error) };
+  }
+
+  async function sendCurrentFlowNodeOnce(
     params: SendCurrentNodeParams
   ): Promise<{ ok: boolean; nodeCode?: string; error?: string }> {
     let result: { ok: boolean; nodeCode?: string; error?: string };
@@ -1744,7 +1820,7 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         flowSessionId: c.active_flow_session_id ?? null,
         eventType: "flow_send_failed",
         payload: {
-          error_message: errorMessage.slice(0, 500),
+          error_message: summarizeSendError(errorMessage),
           reason,
         },
       });
@@ -1776,7 +1852,38 @@ export function createFlowEngine(ctx: FlowEngineContext) {
     }
 
     const nodeFetched = await getNode(state.empresa_id, state.flow_code, state.flow_current_node);
-    if (!nodeFetched) return { ok: false, error: "Nodo actual no encontrado" };
+    if (!nodeFetched) {
+      /**
+       * El puntero GUARDADO apunta a un nodo que no existe o se desactivó (p. ej. "inicio" de una
+       * versión vieja del flujo). Antes esto fallaba siempre con "Nodo actual no encontrado" y la
+       * conversación quedaba trabada para siempre por cualquier camino que no fuera un mensaje
+       * entrante (botones de campaña, reenvío manual). Se reinicia igual que la reparación del
+       * webhook. Sólo en el primer salto: si el nodo roto aparece en un encadenado es un
+       * `next_node_code` mal configurado, y reiniciar haría al cliente dar vueltas al flujo.
+       */
+      if (currentHop === 0) {
+        const invalidNode = state.flow_current_node;
+        const rr = await restartWhatsappConversationToFlowStart(supabase, state.empresa_id, state.id, {
+          preferFlowCode: state.flow_code,
+          trigger: "invalid_current_node_on_send",
+          preserveReferralFromPreviousSession: true,
+        });
+        logFlowStateTransition({
+          conversationId: state.id,
+          flowSessionId: state.active_flow_session_id ?? null,
+          expectedNode: invalidNode,
+          expectedField: null,
+          lastQuestionSent: null,
+          textValue: null,
+          nextNode: rr.flow_current_node,
+          result: rr.restarted ? "invalid_node_restarted_at_flow_start" : `invalid_node_restart_failed:${rr.reason}`,
+        });
+        if (rr.restarted) {
+          return sendCurrentFlowNodeOnce({ ...params, __autoHop: currentHop + 1 });
+        }
+      }
+      return { ok: false, error: "Nodo actual no encontrado" };
+    }
 
     const sidGate = state.active_flow_session_id.trim();
     const hydFdPointer = await buildHydratedFlowDataForCompletenessGate({
@@ -1843,7 +1950,7 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         nextNode: ptrResolved.effectiveNodeCode,
         result: `pointer_rewound_missing:${(descPtr?.missing_fields ?? []).join(",")}`,
       });
-      return sendCurrentFlowNode({ ...params, __autoHop: currentHop });
+      return sendCurrentFlowNodeOnce({ ...params, __autoHop: currentHop });
     }
 
     /**
@@ -1887,7 +1994,7 @@ export function createFlowEngine(ctx: FlowEngineContext) {
           nextNodeCode: nextRecall,
         });
         if (!advRecall.ok) return { ok: false, error: advRecall.error ?? "advance_failed" };
-        return sendCurrentFlowNode({ ...params, __autoHop: currentHop + 1 });
+        return sendCurrentFlowNodeOnce({ ...params, __autoHop: currentHop + 1 });
       }
 
       identityRecallVars = buildIdentityRecallVars(recallCliente);
@@ -1964,7 +2071,7 @@ export function createFlowEngine(ctx: FlowEngineContext) {
           nextNodeCode: nextAfterCaptured,
         });
         if (!advSkip.ok) return { ok: false, error: advSkip.error ?? "advance_failed" };
-        return sendCurrentFlowNode({ ...params, __autoHop: currentHop + 1 });
+        return sendCurrentFlowNodeOnce({ ...params, __autoHop: currentHop + 1 });
       }
     }
 
@@ -3902,7 +4009,8 @@ export function createFlowEngine(ctx: FlowEngineContext) {
      * Sólo pasa si algo movió el puntero entre la presentación y este handler (otro mensaje
      * procesándose en paralelo): el otro handler es dueño del paso, así que éste no guarda ni envía.
      */
-    const lastQuestionSent = await getLastNodeSentInSession(state.id, state.flow_code, textFlowSid);
+    const lastQuestion = await getLastQuestionSentInSession(state.id, state.flow_code, textFlowSid);
+    const lastQuestionSent = lastQuestion?.nodeCode ?? null;
     if (lastQuestionSent && lastQuestionSent !== expectedNode) {
       logFlowStateTransition({
         conversationId: state.id,
@@ -3930,6 +4038,58 @@ export function createFlowEngine(ctx: FlowEngineContext) {
         },
       });
       return { ok: true, status: "ignored_pointer_not_on_screen" };
+    }
+
+    /**
+     * Un mensaje escrito ANTES de que saliera la pregunta no puede ser su respuesta.
+     *
+     * Es el patrón que más aparece en producción: el cliente manda la imagen del comprobante y
+     * enseguida "Listo". El bot ya movió el puntero a `cedula` pero la pregunta tarda ~2,5 s en
+     * salir; "Listo" cae en ese hueco y quedaba guardado como cédula, y desde ahí toda la carga
+     * de datos se corría un lugar (la cédula en nombre, el nombre en apellido…). Lo mismo cuando
+     * el cliente escribe dos cosas seguidas y la segunda llega pegada a la próxima pregunta.
+     *
+     * Se compara la hora en que el cliente ENVIÓ el mensaje (`timestamp` de Meta, en segundos)
+     * con la hora en que salió la pregunta (`node_sent`). Margen de 2 s: cubre el redondeo del
+     * timestamp a segundos y el desfase de relojes, y nadie lee y contesta una pregunta en menos.
+     * Sin alguno de los dos datos no se descarta nada.
+     */
+    const clientSentAtMs = clientSentAtMsFromRaw(params.rawPayload);
+    const questionFirstSentAtMs = lastQuestion?.firstSentAtMs ?? null;
+    if (
+      clientSentAtMs != null &&
+      questionFirstSentAtMs != null &&
+      textPredatesQuestion({ clientSentAtMs, questionFirstSentAtMs })
+    ) {
+      const adelantoSeg = Math.round((questionFirstSentAtMs - clientSentAtMs) / 1000);
+      logFlowStateTransition({
+        conversationId: state.id,
+        flowSessionId: textFlowSid,
+        expectedNode,
+        expectedField: sfCapture,
+        lastQuestionSent,
+        textValue,
+        nextNode: null,
+        result: `ignored_text_predates_question:${adelantoSeg}s`,
+      });
+      await insertFlowEvent({
+        empresaId: state.empresa_id,
+        conversationId: state.id,
+        flowCode: state.flow_code,
+        nodeCode: expectedNode,
+        flowSessionId: textFlowSid,
+        eventType: "text_predates_question",
+        payload: {
+          expected_node: expectedNode,
+          expected_field: sfCapture,
+          text_value: textValue,
+          client_sent_at: new Date(clientSentAtMs).toISOString(),
+          question_sent_at: new Date(questionFirstSentAtMs).toISOString(),
+          seconds_before_question: adelantoSeg,
+          wa_message_id: waMessageIdFromRawPayload(params.rawPayload),
+        },
+      });
+      return { ok: true, status: "ignored_text_predates_question" };
     }
 
     /**

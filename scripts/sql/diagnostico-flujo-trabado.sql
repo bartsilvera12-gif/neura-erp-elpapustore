@@ -200,6 +200,8 @@ LIMIT 100;
 
 -- #############################################################################
 -- BLOQUE 5 — Después del deploy del fix: los eventos nuevos.
+--   text_predates_question      texto escrito antes de que saliera la pregunta (el "Listo" tras
+--                               el comprobante): antes se guardaba y corría toda la carga
 --   text_reply_lost_race        mensaje duplicado o ráfaga que antes corría los campos
 --   capture_pointer_mismatch    respuesta que antes se guardaba en el campo equivocado
 --   sorteo_manual_approval_resume_send_failed  retoma manual cuya pregunta no salió
@@ -211,6 +213,7 @@ SELECT
   count(*) AS veces
 FROM elpapustore_erp.chat_flow_events e
 WHERE e.event_type IN (
+    'text_predates_question',
     'text_reply_lost_race',
     'capture_pointer_mismatch',
     'sorteo_manual_approval_resume_send_failed'
