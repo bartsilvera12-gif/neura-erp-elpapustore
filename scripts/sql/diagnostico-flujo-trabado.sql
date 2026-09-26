@@ -61,13 +61,10 @@ WITH cap AS (
 cap_marcada AS (
   SELECT
     c.*,
+    /* ventana en vez de auto-join: la version anterior daba timeout en produccion */
     (
       c.wa_id IS NOT NULL
-      AND EXISTS (
-        SELECT 1 FROM cap c2
-        WHERE c2.wa_id = c.wa_id
-          AND (c2.created_at, c2.id) < (c.created_at, c.id)
-      )
+      AND row_number() OVER (PARTITION BY c.wa_id ORDER BY c.created_at, c.id) > 1
     ) AS es_duplicado,
     (
       SELECT ns.node_code
