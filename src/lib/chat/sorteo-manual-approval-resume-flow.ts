@@ -151,14 +151,12 @@ export async function runManualApprovalResumeParticipantFlow(input: {
     .eq("id", sid)
     .eq("empresa_id", input.empresaId);
 
-  const adv = await advanceConversationToNode(input.supabase, {
-    conversationId: input.conversationId,
-    empresaId: input.empresaId,
-    flowCode: fc,
-    nextNodeCode: input.nextNodeCode,
-  });
-  if (!adv.ok) throw new Error(adv.error ?? "advanceConversationToNode");
-
+  /**
+   * Primero la sesión, después el puntero. Al revés quedaba una ventana con el puntero ya en el
+   * nodo de retoma pero la conversación todavía apuntando a la sesión anterior: un mensaje del
+   * cliente en ese momento se procesaba contra la sesión equivocada (datos y "ya enviado" de otra
+   * compra).
+   */
   const { error: convSidErr } = await input.supabase
     .from("chat_conversations")
     .update({
@@ -168,6 +166,14 @@ export async function runManualApprovalResumeParticipantFlow(input: {
     .eq("id", input.conversationId)
     .eq("empresa_id", input.empresaId);
   if (convSidErr) throw new Error(convSidErr.message);
+
+  const adv = await advanceConversationToNode(input.supabase, {
+    conversationId: input.conversationId,
+    empresaId: input.empresaId,
+    flowCode: fc,
+    nextNodeCode: input.nextNodeCode,
+  });
+  if (!adv.ok) throw new Error(adv.error ?? "advanceConversationToNode");
 
   await input.supabase.from("chat_flow_events").insert({
     empresa_id: input.empresaId,
@@ -228,12 +234,39 @@ export async function runManualApprovalResumeParticipantFlow(input: {
     });
   }
 
-  await sendCurrentFlowNode(input.supabase, {
+  /**
+   * Antes se ignoraba el resultado: si la pregunta no salía, el puntero quedaba en un nodo de
+   * captura que el cliente nunca vio, y el operador creía haberlo destrabado. Ahora el fallo
+   * queda como evento y le llega al operador como aviso.
+   */
+  const sentNode = await sendCurrentFlowNode(input.supabase, {
     conversationId: input.conversationId,
   });
+  if (!sentNode.ok) {
+    await input.supabase.from("chat_flow_events").insert({
+      empresa_id: input.empresaId,
+      conversation_id: input.conversationId,
+      flow_code: fc,
+      node_code: input.nextNodeCode,
+      flow_session_id: sid,
+      event_type: "sorteo_manual_approval_resume_send_failed",
+      payload: {
+        validation_id: input.validationId,
+        next_node_code: input.nextNodeCode,
+        error: (sentNode.error ?? "send_failed").slice(0, 300),
+      },
+    });
+  }
+
+  const warnings = [
+    sendIntro.ok ? null : sendIntro.error,
+    sentNode.ok
+      ? null
+      : `No se pudo enviar la pregunta del paso "${input.nextNodeCode}" al cliente (${sentNode.error ?? "error desconocido"}). Usá "Reenviar paso actual".`,
+  ].filter((w): w is string => Boolean(w));
 
   return {
-    whatsappWarning: sendIntro.ok ? undefined : sendIntro.error,
+    whatsappWarning: warnings.length ? warnings.join(" · ") : undefined,
   };
 }
 

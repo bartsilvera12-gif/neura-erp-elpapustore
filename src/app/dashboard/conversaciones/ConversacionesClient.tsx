@@ -1506,7 +1506,7 @@ export function ConversacionesClient({
     let confirmHumanOverride = false;
     if (sel.human_taken_over || sel.flow_status === "human") {
       const ok = window.confirm(
-        "La conversación está en modo humano. ¿Reenviar igualmente el mensaje del paso actual del bot?"
+        "La conversación está en modo humano. Si reenviás el paso actual, vuelve al bot para que procese la respuesta del cliente. ¿Continuar?"
       );
       if (!ok) return;
       confirmHumanOverride = true;
@@ -1536,7 +1536,7 @@ export function ConversacionesClient({
       let { res, json } = await postOnce(confirmHumanOverride);
       if (res.status === 409 && json.needs_human_override_confirmation) {
         const ok = window.confirm(
-          "La conversación está en modo humano. ¿Reenviar igualmente el mensaje del paso actual del bot?"
+          "La conversación está en modo humano. Si reenviás el paso actual, vuelve al bot para que procese la respuesta del cliente. ¿Continuar?"
         );
         if (!ok) return;
         ({ res, json } = await postOnce(true));
