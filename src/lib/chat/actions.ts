@@ -621,10 +621,12 @@ async function fetchChatConversationsUnsafe(
       ? hasCatalog
         ? ["bot_sesion_activa", "bot_catalogo_sin_sesion"]
         : ["bot_sesion_activa"]
-      : hasCatalog
-        ? ["inbox_humano", "inbox_sesion_no_activa", "inbox_sin_sesion_sin_flujo"]
-        : // Sin flujos activos en catálogo toda conversación abierta/pendiente es Inbox (regla en memoria).
-          ["inbox_todo"];
+      : /**
+         * El Papu: la Inbox son SOLO las conversaciones escaladas a un asesor humano (el cliente tocó
+         * "Hablar con asesor"). Decisión de producto previa: las del bot sin sesión vigente no se
+         * muestran en ninguna pestaña (quedan en Historial/búsqueda). Ver filtro equivalente sin paginar.
+         */
+        ["inbox_humano"];
 
   /** Ver `appendOmnicanalConversationScopeToQuery`: el builder PostgREST no debe devolverse “crudo” desde async. */
   const buildFilteredConversationQuery = async (selectStr: string, part?: TabPart) => {
@@ -637,6 +639,10 @@ async function fetchChatConversationsUnsafe(
     if (vista === "inbox" || vista === "bot") {
       /** Misma base abierta/pendiente; sin `part` Inbox vs Bot se resuelve en memoria (`conversationBelongsToBotTab`). */
       qb = qb.in("status", ["open", "pending"]);
+      if (!part && vista === "inbox") {
+        /** Sin paginar (búsqueda): misma regla El Papu, Inbox = escaladas a humano. */
+        qb = qb.or("human_taken_over.is.true,flow_status.ilike.human");
+      }
       const notHuman = () => {
         qb = qb.or("human_taken_over.is.null,human_taken_over.is.false");
         qb = qb.or("flow_status.is.null,flow_status.not.ilike.human");
