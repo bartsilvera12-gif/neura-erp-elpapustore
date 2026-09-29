@@ -564,38 +564,69 @@ async function fetchChatConversationsUnsafe(
     `;
 
   /** Ver `appendOmnicanalConversationScopeToQuery`: el builder PostgREST no debe devolverse “crudo” desde async. */
-  const buildFilteredConversationQuery = async (selectStr: string) => {
-    let qb = supabase.from("chat_conversations").select(selectStr).eq("empresa_id", empresa_id);
+  /**
+   * Pestañas Inbox/Bot como PARTICIÓN en la consulta (paginado): cada pestaña es la unión de 2-3
+   * consultas ordenadas que replican `evaluateBotConversation` (inbox-bot-tab-classification.ts):
+   *  - bot_sesion_activa: no humano + puntero a sesión active/running (join !inner a chat_flow_sessions);
+   *  - bot_catalogo_sin_sesion: no humano + sin puntero + flow_status bot/active/running + flujo en catálogo;
+   *  - inbox_humano: human_taken_over o flow_status human;
+   *  - inbox_sesion_no_activa: puntero a sesión que no está active/running (completed/abandoned/restarted);
+   *  - inbox_sin_sesion_sin_flujo: sin puntero y sin flujo bot válido.
+   * Cada conversación abierta/pendiente cae en exactamente una pestaña (la FK impide punteros colgados).
+   * Antes se traían las ~1000 más recientes de todo y se separaba en memoria: la Inbox perdía las
+   * humanas más viejas que esas 1000 y Bot hacía todos los lookups por fila sobre 1000 filas.
+   * Diferencias con la regla en memoria (sin efecto hoy en Mevo): sesión activa encontrada solo por
+   * conversation_id (sin puntero) cuenta como Inbox; sesión de otra conversación cuenta como Bot.
+   */
+  type TabPart =
+    | "bot_sesion_activa"
+    | "bot_catalogo_sin_sesion"
+    | "inbox_humano"
+    | "inbox_sesion_no_activa"
+    | "inbox_sin_sesion_sin_flujo";
+  const SESSION_EMBED = "sess:chat_flow_sessions!chat_conversations_active_flow_session_id_fkey!inner(status)";
+  const flowTokens = [...activeFlowCodeSet].filter((tok) => /^[A-Za-z0-9_.:-]+$/.test(tok));
+  const tabParts: TabPart[] =
+    vista === "bot"
+      ? flowTokens.length > 0
+        ? ["bot_sesion_activa", "bot_catalogo_sin_sesion"]
+        : ["bot_sesion_activa"]
+      : ["inbox_humano", "inbox_sesion_no_activa", "inbox_sin_sesion_sin_flujo"];
+
+  /** Ver `appendOmnicanalConversationScopeToQuery`: el builder PostgREST no debe devolverse “crudo” desde async. */
+  const buildFilteredConversationQuery = async (selectStr: string, part?: TabPart) => {
+    const needsSession = part === "bot_sesion_activa" || part === "inbox_sesion_no_activa";
+    let qb = supabase
+      .from("chat_conversations")
+      .select(needsSession ? `${selectStr}, ${SESSION_EMBED}` : selectStr)
+      .eq("empresa_id", empresa_id);
 
     if (vista === "inbox" || vista === "bot") {
-      /** Misma base abierta/pendiente; la clasificación exacta sigue en memoria (`conversationBelongsToBotTab`). */
+      /** Misma base abierta/pendiente; sin `part` Inbox vs Bot se resuelve en memoria (`conversationBelongsToBotTab`). */
       qb = qb.in("status", ["open", "pending"]);
-      /**
-       * Prefiltro por pestaña en la consulta: sin esto se traían las ~1000 más recientes de TODO el
-       * universo (casi todas de bot) y recién después se separaba; la Inbox perdía las conversaciones
-       * humanas más viejas que esas 1000 y Bot hacía todos los lookups por fila sobre 1000 filas.
-       * Es un superconjunto de la regla exacta (`evaluateBotConversation`) salvo dos casos raros que
-       * no se pueden expresar sin mirar `chat_flow_sessions`: puntero a sesión NO activa (Inbox) y
-       * sesión activa sin puntero con flujo fuera de catálogo (Bot).
-       */
-      const flowTokens = [...activeFlowCodeSet].filter((t) => /^[A-Za-z0-9_.:-]+$/.test(t));
-      const botishAndCatalog =
-        flowTokens.length > 0
-          ? `and(flow_status.in.(bot,active,running),flow_code.in.(${flowTokens.join(",")}))`
-          : null;
-      if (vista === "bot") {
+      const notHuman = () => {
         qb = qb.or("human_taken_over.is.null,human_taken_over.is.false");
-        qb = qb.or("flow_status.is.null,flow_status.neq.human");
+        qb = qb.or("flow_status.is.null,flow_status.not.ilike.human");
+      };
+      if (part === "bot_sesion_activa") {
+        notHuman();
+        qb = qb.or("status.ilike.active,status.ilike.running", { referencedTable: "sess" });
+      } else if (part === "bot_catalogo_sin_sesion") {
+        notHuman();
+        qb = qb
+          .is("active_flow_session_id", null)
+          .or("flow_status.ilike.bot,flow_status.ilike.active,flow_status.ilike.running")
+          .in("flow_code", flowTokens);
+      } else if (part === "inbox_humano") {
+        qb = qb.or("human_taken_over.is.true,flow_status.ilike.human");
+      } else if (part === "inbox_sesion_no_activa") {
+        qb = qb.not("sess.status", "ilike", "active").not("sess.status", "ilike", "running");
+      } else if (part === "inbox_sin_sesion_sin_flujo") {
+        qb = qb.is("active_flow_session_id", null);
         qb = qb.or(
-          botishAndCatalog
-            ? `active_flow_session_id.not.is.null,${botishAndCatalog}`
-            : "active_flow_session_id.not.is.null"
-        );
-      } else if (botishAndCatalog) {
-        qb = qb.or(
-          "human_taken_over.is.true,flow_status.eq.human," +
-            "and(active_flow_session_id.is.null,or(flow_status.is.null,flow_status.not.in.(bot,active,running)," +
-            `flow_code.is.null,flow_code.not.in.(${flowTokens.join(",")})))`
+          "flow_status.is.null," +
+            "and(flow_status.not.ilike.bot,flow_status.not.ilike.active,flow_status.not.ilike.running)," +
+            (flowTokens.length > 0 ? `flow_code.is.null,flow_code.not.in.(${flowTokens.join(",")})` : "flow_code.is.null,flow_code.not.is.null")
         );
       }
     } else if (vista === "historial") {
@@ -701,8 +732,8 @@ async function fetchChatConversationsUnsafe(
   /**
    * Paginación por cursor: solo Inbox/Bot sin búsqueda (la búsqueda ya trae pocas filas).
    * Orden estable (last_message_at DESC NULLS LAST, id DESC) + keyset; se pide una fila de más
-   * para saber si hay otra página. El cursor sale de las filas CRUDAS (antes del filtro exacto
-   * en memoria), así ninguna fila se saltea aunque una página quede con menos de `pageLimit`.
+   * para saber si hay otra página. Paginado, la pestaña se arma por partes en SQL (`tabParts`)
+   * y no se vuelve a filtrar en memoria.
    */
   const pageLimit =
     (vista === "inbox" || vista === "bot") && !searchContactIds && filters?.page_limit
@@ -726,20 +757,60 @@ async function fetchChatConversationsUnsafe(
     return r.limit(pageLimit + 1);
   };
 
-  /* PostgREST: desempaquetar `.builder` — el builder es thenable y no puede devolverse solo desde async. */
-  let q: any = (await buildFilteredConversationQuery(convSelectWithWait)).builder;
-  let { data: convs, error } = await orderAndPage(q);
+  /**
+   * Sin paginar: una consulta (como antes). Paginado: una consulta por parte de la pestaña, en
+   * paralelo, y merge ordenado (keyset correcto: el top N+1 de la unión está dentro del top N+1
+   * de cada parte). Dedupe por id (p. ej. humano con puntero a sesión no activa).
+   */
+  const runListQuery = async (selectStr: string): Promise<{ data: unknown[] | null; error: { message: string } | null }> => {
+    if (!pageLimit) {
+      const qb: any = (await buildFilteredConversationQuery(selectStr)).builder;
+      const { data, error: e } = await orderAndPage(qb);
+      return { data: (data as unknown[] | null) ?? null, error: e ?? null };
+    }
+    const results = await Promise.all(
+      tabParts.map(async (part) => {
+        const qb: any = (await buildFilteredConversationQuery(selectStr, part)).builder;
+        return orderAndPage(qb) as Promise<{ data: unknown[] | null; error: { message: string } | null }>;
+      })
+    );
+    const failed = results.find((r) => r.error);
+    if (failed) return { data: null, error: failed.error };
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const r of results) {
+      for (const row of (r.data ?? []) as Record<string, unknown>[]) {
+        const id = String(row.id ?? "");
+        if (!id || byId.has(id)) continue;
+        const { sess: _sess, ...rest } = row;
+        void _sess;
+        byId.set(id, rest);
+      }
+    }
+    const tsOf = (row: Record<string, unknown>) => {
+      const v = row.last_message_at;
+      const n = typeof v === "string" ? Date.parse(v) : NaN;
+      return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY;
+    };
+    const merged = [...byId.values()].sort((a, b) => {
+      const d = tsOf(b) - tsOf(a);
+      if (d !== 0 && !Number.isNaN(d)) return d;
+      const ia = String(a.id);
+      const ib = String(b.id);
+      return ia < ib ? 1 : ia > ib ? -1 : 0;
+    });
+    return { data: merged.slice(0, pageLimit + 1), error: null };
+  };
+
+  let { data: convs, error } = await runListQuery(convSelectWithWait);
 
   if (error && isMissingColumnError(error.message, "assignment_wait_code")) {
     console.warn("[fetchChatConversations] assignment_wait_code ausente; reintento sin columna");
-    q = (await buildFilteredConversationQuery(convSelectLegacy)).builder;
-    ({ data: convs, error } = await orderAndPage(q));
+    ({ data: convs, error } = await runListQuery(convSelectLegacy));
   }
 
   if (error) {
     console.warn("[fetchChatConversations] reintento select mínimo sin priority ni assignment_wait_code");
-    q = (await buildFilteredConversationQuery(convSelectLegacyNoPriority)).builder;
-    ({ data: convs, error } = await orderAndPage(q));
+    ({ data: convs, error } = await runListQuery(convSelectLegacyNoPriority));
   }
 
   if (error) {
@@ -847,7 +918,10 @@ async function fetchChatConversationsUnsafe(
   const isBotRow = (row: Record<string, unknown>) => conversationBelongsToBotTab(row, classifyCtx);
 
   let botLikeCount = 0;
-  if (vista === "inbox") {
+  if (pageLimit) {
+    /** Paginado: la pestaña ya viene particionada en SQL (`tabParts`); no se re-filtra en memoria. */
+    botLikeCount = vista === "bot" ? list.length : 0;
+  } else if (vista === "inbox") {
     botLikeCount = list.filter((row) => isBotRow(row as Record<string, unknown>)).length;
     list = list.filter((row) => !isBotRow(row as Record<string, unknown>));
   } else if (vista === "bot") {

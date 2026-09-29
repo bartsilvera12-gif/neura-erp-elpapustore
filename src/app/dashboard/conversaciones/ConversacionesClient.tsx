@@ -1226,6 +1226,16 @@ export function ConversacionesClient({
   }, []);
   const scheduleListRefetchRef = useRef<typeof scheduleListRefetch | null>(null);
   scheduleListRefetchRef.current = scheduleListRefetch;
+  /** Al cambiar de pestaña o salir de la pantalla, descartar el refetch programado. */
+  useEffect(() => {
+    return () => {
+      if (debouncedRefetchTimerRef.current != null) {
+        window.clearTimeout(debouncedRefetchTimerRef.current);
+        debouncedRefetchTimerRef.current = null;
+      }
+      refetchPendingRef.current = false;
+    };
+  }, [vista]);
 
   /**
    * PERF-2A: aplica un cambio de chat_conversations Realtime sobre la lista local
@@ -1260,6 +1270,24 @@ export function ConversacionesClient({
           return prev.filter((c) => c.id !== id);
         }
         const cur = prev[idx];
+        // Cambio de pestaña visible al instante: en Bot, si la toma un humano; en Inbox, si una
+        // conversación humana vuelve al bot (liberada). Estados ambiguos esperan al próximo refetch.
+        {
+          const fsNow = typeof row.flow_status === "string" ? row.flow_status.trim().toLowerCase() : null;
+          const humanNow =
+            row.human_taken_over === true || fsNow === "human"
+              ? true
+              : row.human_taken_over === false && fsNow != null && fsNow !== "human"
+                ? false
+                : null;
+          const wasHuman = cur.human_taken_over || String(cur.flow_status ?? "").toLowerCase() === "human";
+          const leavesBot = vista === "bot" && humanNow === true;
+          const leavesInbox =
+            vista === "inbox" && wasHuman && humanNow === false && (fsNow === "bot" || fsNow === "active" || fsNow === "running");
+          if (leavesBot || leavesInbox) {
+            return prev.filter((c) => c.id !== id);
+          }
+        }
         const next = [...prev];
         const lastMessageAt =
           typeof row.last_message_at === "string" ? row.last_message_at : cur.last_message_at;
