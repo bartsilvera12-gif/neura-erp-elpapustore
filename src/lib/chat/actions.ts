@@ -45,7 +45,8 @@ import {
   logPgPoolStats,
   quoteSchemaTable,
 } from "@/lib/supabase/chat-pg-pool";
-import { isLikelyUnexposedTenantChatSchema } from "@/lib/supabase/chat-data-schema";
+import { assertAllowedChatDataSchema, isLikelyUnexposedTenantChatSchema } from "@/lib/supabase/chat-data-schema";
+import type { Pool } from "pg";
 import { toNationalPhoneDigits } from "@/lib/telefono";
 import {
   pgDeleteChatChannel,
@@ -161,6 +162,48 @@ export type ChatConversationsFetchResult = {
 };
 
 /**
+ * Último mensaje por conversación en UNA consulta (LATERAL + LIMIT 1 por id, usa el índice
+ * chat_messages(conversation_id, created_at)). Reemplaza hasta ~1000 requests PostgREST por carga.
+ * Devuelve null si no se puede (schema inválido o error): el llamador cae al camino PostgREST.
+ */
+async function pgLastMessageByConversationLateral(
+  pool: Pool,
+  schema: string,
+  empresaId: string,
+  convIds: string[]
+): Promise<Record<string, { created_at: string; from_me: boolean }> | null> {
+  const unique = [...new Set(convIds.map((x) => x.trim()).filter(Boolean))];
+  const out: Record<string, { created_at: string; from_me: boolean }> = {};
+  if (unique.length === 0) return out;
+  try {
+    const qt = quoteSchemaTable(assertAllowedChatDataSchema(schema), "chat_messages");
+    const r = await pool.query(
+      `SELECT c.id::text AS conversation_id, m.created_at, m.from_me
+       FROM unnest($2::uuid[]) AS c(id)
+       CROSS JOIN LATERAL (
+         SELECT mm.created_at, mm.from_me
+         FROM ${qt} mm
+         WHERE mm.conversation_id = c.id AND mm.empresa_id = $1::uuid
+         ORDER BY mm.created_at DESC
+         LIMIT 1
+       ) m`,
+      [empresaId, unique]
+    );
+    for (const row of r.rows ?? []) {
+      const cid = String((row as { conversation_id?: string }).conversation_id ?? "").trim();
+      const ca = (row as { created_at?: unknown }).created_at;
+      const created_at = ca instanceof Date ? ca.toISOString() : String(ca ?? "").trim();
+      if (!cid || !created_at) continue;
+      out[cid] = { created_at, from_me: Boolean((row as { from_me?: boolean }).from_me) };
+    }
+    return out;
+  } catch (e) {
+    console.warn("[fetchChatConversations] último mensaje (pg lateral):", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+/**
  * Último mensaje por conversación (respaldo si el RPC de turnos falla o no está desplegado).
  * Una subconsulta por id en paralelo por lotes, para no mezclar límites entre conversaciones.
  */
@@ -206,26 +249,8 @@ export async function fetchChatConversations(
   vista: ConversacionesVista = "inbox",
   filters?: ChatInboxFilters
 ): Promise<ChatConversationsFetchResult> {
-  /**
-   * La ruta PostgREST lanzaba ante cualquier error (query base con timeout bajo carga, RPC ausente,
-   * alcance omnicanal, etc.). En un tenant con decenas de miles de conversaciones open/pending
-   * (p. ej. elpapustore), ese throw crasheaba la lista del inbox con el error genérico de
-   * "Server Components render" en producción. Igualamos el comportamiento de la ruta `tenant_pg`:
-   * degradamos suave a `transient_list_error` para que el cliente conserve la vista previa y muestre
-   * un aviso en lugar de romperse. El error real queda logueado para diagnóstico.
-   */
-  try {
-    return await fetchChatConversationsUnsafe(vista, filters);
-  } catch (e) {
-    console.error("[fetchChatConversations] fallo no controlado; degradando a transient_list_error", {
-      vista,
-      assignment: filters?.assignment ?? null,
-      has_search: Boolean(filters?.search?.trim()),
-      error: e instanceof Error ? e.message : String(e),
-      stack: e instanceof Error ? e.stack?.split("\n").slice(0, 4).join(" | ") : undefined,
-    });
-    return { conversations: [], base_row_count: 0, transient_list_error: true };
-  }
+  /** PostgREST sigue lanzando ante error; tenant_pg puede devolver `transient_list_error` sin tirar la UI. */
+  return fetchChatConversationsUnsafe(vista, filters);
 }
 
 type BotTabClassifyCtx = {
@@ -522,16 +547,35 @@ async function fetchChatConversationsUnsafe(
     let qb = supabase.from("chat_conversations").select(selectStr).eq("empresa_id", empresa_id);
 
     if (vista === "inbox" || vista === "bot") {
-      /** Misma base abierta/pendiente; Inbox vs Bot se resuelve en memoria (`conversationBelongsToBotTab`). */
+      /** Misma base abierta/pendiente; la clasificación exacta sigue en memoria (`conversationBelongsToBotTab`). */
       qb = qb.in("status", ["open", "pending"]);
       /**
-       * Inbox = conversaciones escaladas a un asesor humano (el cliente tocó "Hablar con asesor").
-       * Se filtran en la BASE (human_taken_over=true OR flow_status='human') para que NO queden
-       * tapadas por el tope ~1000 de conversaciones del bot, que son la enorme mayoría (p. ej. El Papu).
-       * En memoria `conversationBelongsToBotTab` confirma la exclusión de las del bot.
+       * Prefiltro por pestaña en la consulta: sin esto se traían las ~1000 más recientes de TODO el
+       * universo (casi todas de bot) y recién después se separaba; la Inbox perdía las conversaciones
+       * humanas más viejas que esas 1000 y Bot hacía todos los lookups por fila sobre 1000 filas.
+       * Es un superconjunto de la regla exacta (`evaluateBotConversation`) salvo dos casos raros que
+       * no se pueden expresar sin mirar `chat_flow_sessions`: puntero a sesión NO activa (Inbox) y
+       * sesión activa sin puntero con flujo fuera de catálogo (Bot).
        */
-      if (vista === "inbox") {
-        qb = qb.or("human_taken_over.eq.true,flow_status.eq.human");
+      const flowTokens = [...activeFlowCodeSet].filter((t) => /^[A-Za-z0-9_.:-]+$/.test(t));
+      const botishAndCatalog =
+        flowTokens.length > 0
+          ? `and(flow_status.in.(bot,active,running),flow_code.in.(${flowTokens.join(",")}))`
+          : null;
+      if (vista === "bot") {
+        qb = qb.or("human_taken_over.is.null,human_taken_over.is.false");
+        qb = qb.or("flow_status.is.null,flow_status.neq.human");
+        qb = qb.or(
+          botishAndCatalog
+            ? `active_flow_session_id.not.is.null,${botishAndCatalog}`
+            : "active_flow_session_id.not.is.null"
+        );
+      } else if (botishAndCatalog) {
+        qb = qb.or(
+          "human_taken_over.is.true,flow_status.eq.human," +
+            "and(active_flow_session_id.is.null,or(flow_status.is.null,flow_status.not.in.(bot,active,running)," +
+            `flow_code.is.null,flow_code.not.in.(${flowTokens.join(",")})))`
+        );
       }
     } else if (vista === "historial") {
       qb = qb.eq("status", "closed");
@@ -925,7 +969,12 @@ async function fetchChatConversationsUnsafe(
     } catch (e) {
       console.warn("[fetchChatConversations] awaiting_reply RPC:", e instanceof Error ? e.message : e);
     }
-    const lastByConv = await mapLastMessageByConversation(supabase, empresa_id, convIdList);
+    /** Solo las que el RPC no resolvió (en schemas fuera de su allowlist, como mevoerp, son todas). */
+    const unresolvedIds = convIdList.filter((id) => awaitingById[id] == null && clientTurnById[id] == null);
+    const lastByConv =
+      (poolInbox
+        ? await pgLastMessageByConversationLateral(poolInbox, dataSchema, empresa_id, unresolvedIds)
+        : null) ?? (await mapLastMessageByConversation(supabase, empresa_id, unresolvedIds));
     for (const id of convIdList) {
       if (awaitingById[id] != null || clientTurnById[id] != null) continue;
       const last = lastByConv[id];
@@ -1046,7 +1095,7 @@ async function fetchChatConversationsUnsafe(
         .filter((x): x is string => Boolean(x && x.length > 0))
     ),
   ];
-  const byId: Record<string, Record<string, unknown>> = {};
+  let byId: Record<string, Record<string, unknown>> = {};
   if (contactIds.length > 0) {
     const cchunk = 80;
     for (let i = 0; i < contactIds.length; i += cchunk) {

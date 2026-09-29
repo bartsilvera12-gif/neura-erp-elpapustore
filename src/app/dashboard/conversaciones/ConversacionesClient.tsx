@@ -1118,14 +1118,40 @@ export function ConversacionesClient({
    * rapidos en una sola llamada y respeta visibilidad.
    */
   const debouncedRefetchTimerRef = useRef<number | null>(null);
+  /**
+   * Anti-tormenta: con ~30 mensajes/min el refetch se disparaba casi continuo y se encimaba
+   * (cada carga tarda segundos). Nunca dos a la vez, y al menos LIST_REFETCH_MIN_GAP_MS entre
+   * el fin de una y el inicio de la siguiente; lo que llegue mientras tanto queda pendiente.
+   */
+  const LIST_REFETCH_MIN_GAP_MS = 10_000;
+  const refetchInFlightRef = useRef(false);
+  const refetchPendingRef = useRef(false);
+  const lastRefetchEndRef = useRef(0);
   const scheduleListRefetch = useCallback((delayMs = 1500) => {
+    if (refetchInFlightRef.current) {
+      refetchPendingRef.current = true;
+      return;
+    }
     if (debouncedRefetchTimerRef.current != null) return;
+    const sinceLast = Date.now() - lastRefetchEndRef.current;
+    const wait = Math.max(delayMs, LIST_REFETCH_MIN_GAP_MS - sinceLast);
     debouncedRefetchTimerRef.current = window.setTimeout(() => {
       debouncedRefetchTimerRef.current = null;
       if (document.visibilityState !== "visible") return;
-      void loadConversationsRef.current?.({ silent: true });
-    }, delayMs);
+      refetchInFlightRef.current = true;
+      refetchPendingRef.current = false;
+      void Promise.resolve(loadConversationsRef.current?.({ silent: true })).finally(() => {
+        refetchInFlightRef.current = false;
+        lastRefetchEndRef.current = Date.now();
+        if (refetchPendingRef.current) {
+          refetchPendingRef.current = false;
+          scheduleListRefetchRef.current?.(1500);
+        }
+      });
+    }, wait);
   }, []);
+  const scheduleListRefetchRef = useRef<typeof scheduleListRefetch | null>(null);
+  scheduleListRefetchRef.current = scheduleListRefetch;
 
   /**
    * PERF-2A: aplica un cambio de chat_conversations Realtime sobre la lista local
@@ -1145,7 +1171,14 @@ export function ConversacionesClient({
         if (idx < 0) {
           // Conversación no presente en la lista local. Solo si entra al universo
           // visible (open/pending, no oculta) vale la pena reconciliar.
-          if (stillInScope && !hiddenByTag) scheduleListRefetch(1500);
+          // Y solo si puede pertenecer a la pestaña actual: en Inbox, un chat claramente
+          // de bot (sin humano, flow_status bot) no aparecería tras el refetch; en Bot, uno
+          // tomado por humano tampoco. Así la actividad del bot no recarga la Inbox sin parar.
+          const fs = typeof row.flow_status === "string" ? row.flow_status.trim().toLowerCase() : "";
+          const human = row.human_taken_over === true || fs === "human";
+          const clearlyBot = !human && (fs === "bot" || fs === "active" || fs === "running");
+          const irrelevant = (vista === "inbox" && clearlyBot) || (vista === "bot" && human);
+          if (stillInScope && !hiddenByTag && !irrelevant) scheduleListRefetch(1500);
           return prev;
         }
         // Si sale del universo visible, quitarla.
@@ -1183,7 +1216,7 @@ export function ConversacionesClient({
         return next;
       });
     },
-    [scheduleListRefetch]
+    [scheduleListRefetch, vista]
   );
 
   /**
@@ -1203,7 +1236,8 @@ export function ConversacionesClient({
       setConversations((prev) => {
         const idx = prev.findIndex((c) => c.id === convId);
         if (idx < 0) {
-          scheduleListRefetch(1500);
+          // Sin refetch acá: cada mensaje también actualiza chat_conversations (last_message_at),
+          // y ese evento (patchConversationFromRealtime) ya decide si hace falta recargar.
           return prev;
         }
         const cur = prev[idx];
@@ -1223,7 +1257,7 @@ export function ConversacionesClient({
         return next;
       });
     },
-    [scheduleListRefetch]
+    []
   );
 
   /** Lista: Realtime sobre conversaciones (PERF-2A: merge incremental, sin full refetch). */
