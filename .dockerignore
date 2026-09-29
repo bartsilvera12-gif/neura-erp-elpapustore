@@ -1,0 +1,18 @@
+# Dependencias y build: se regeneran dentro del contenedor
+node_modules
+.next
+out
+
+# Git y metadatos
+.git
+.gitignore
+.cursor
+.claude
+.mcp.json
+
+# Env: los inyecta Coolify, no van en la imagen
+.env*
+
+# Docs (no los usa la app en runtime)
+docs
+*.md
