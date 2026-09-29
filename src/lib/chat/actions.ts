@@ -173,13 +173,32 @@ export type ChatConversationsFetchResult = {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Valida el cursor que manda el cliente (se interpola en el filtro PostgREST). */
+/** Timestamp ISO tal como lo devuelve PostgREST (hasta microsegundos, con offset). */
+const PG_TS_RE = /^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)$/;
+
+/**
+ * Clave ordenable con precisión de microsegundos (la de Postgres). `Date.parse` recorta a
+ * milisegundos: en empates sub-ms el orden y el cursor no coincidirían con Postgres.
+ */
+function inboxTimestampSortKeySync(v: unknown): string {
+  if (typeof v !== "string") return "";
+  const m = PG_TS_RE.exec(v.trim());
+  if (!m) return "";
+  const frac = (m[2] ?? "").padEnd(6, "0");
+  const off = m[3];
+  if (off === "Z" || /^\+00(:?00)?$/.test(off)) return `${m[1].replace(" ", "T")}.${frac}`;
+  const ms = Date.parse(v);
+  if (!Number.isFinite(ms)) return "";
+  return `${new Date(ms).toISOString().slice(0, 19)}.${frac}`;
+}
+
+/** Valida el cursor que manda el cliente (se interpola en el filtro PostgREST); conserva la precisión. */
 function sanitizeInboxCursor(c: ChatInboxCursor | null | undefined): ChatInboxCursor | null {
   if (!c || typeof c.id !== "string" || !UUID_RE.test(c.id.trim())) return null;
   if (c.last_message_at == null) return { last_message_at: null, id: c.id.trim() };
-  const t = Date.parse(String(c.last_message_at));
-  if (!Number.isFinite(t)) return null;
-  return { last_message_at: new Date(t).toISOString(), id: c.id.trim() };
+  const ts = String(c.last_message_at).trim();
+  if (!PG_TS_RE.test(ts)) return null;
+  return { last_message_at: ts, id: c.id.trim() };
 }
 
 /**
@@ -583,15 +602,29 @@ async function fetchChatConversationsUnsafe(
     | "bot_catalogo_sin_sesion"
     | "inbox_humano"
     | "inbox_sesion_no_activa"
-    | "inbox_sin_sesion_sin_flujo";
+    | "inbox_sin_sesion_sin_flujo"
+    | "inbox_todo";
   const SESSION_EMBED = "sess:chat_flow_sessions!chat_conversations_active_flow_session_id_fkey!inner(status)";
-  const flowTokens = [...activeFlowCodeSet].filter((tok) => /^[A-Za-z0-9_.:-]+$/.test(tok));
+  /**
+   * Tokens del catálogo comparados SIN distinguir mayúsculas (como `flowTokenMatchesActiveCatalog`):
+   * `ilike` con `\`, `_` y `%` escapados = igualdad case-insensitive. Si algún token trae caracteres
+   * que no se pueden expresar de forma segura en el filtro, no se pagina (camino en memoria de siempre).
+   */
+  const flowTokensLower = [...new Set([...activeFlowCodeSet].map((tok) => tok.toLowerCase()))];
+  const flowTokensSafe = flowTokensLower.every((tok) => /^[a-z0-9_.:-]+$/.test(tok));
+  const escLike = (tok: string) => tok.replace(/[\\_%]/g, (ch) => "\\" + ch);
+  const catalogMatchOr = flowTokensLower.map((tok) => `flow_code.ilike.${escLike(tok)}`).join(",");
+  const catalogNoMatchAnd = flowTokensLower.map((tok) => `flow_code.not.ilike.${escLike(tok)}`).join(",");
+  const hasCatalog = flowTokensLower.length > 0;
   const tabParts: TabPart[] =
     vista === "bot"
-      ? flowTokens.length > 0
+      ? hasCatalog
         ? ["bot_sesion_activa", "bot_catalogo_sin_sesion"]
         : ["bot_sesion_activa"]
-      : ["inbox_humano", "inbox_sesion_no_activa", "inbox_sin_sesion_sin_flujo"];
+      : hasCatalog
+        ? ["inbox_humano", "inbox_sesion_no_activa", "inbox_sin_sesion_sin_flujo"]
+        : // Sin flujos activos en catálogo toda conversación abierta/pendiente es Inbox (regla en memoria).
+          ["inbox_todo"];
 
   /** Ver `appendOmnicanalConversationScopeToQuery`: el builder PostgREST no debe devolverse “crudo” desde async. */
   const buildFilteredConversationQuery = async (selectStr: string, part?: TabPart) => {
@@ -616,7 +649,7 @@ async function fetchChatConversationsUnsafe(
         qb = qb
           .is("active_flow_session_id", null)
           .or("flow_status.ilike.bot,flow_status.ilike.active,flow_status.ilike.running")
-          .in("flow_code", flowTokens);
+          .or(catalogMatchOr);
       } else if (part === "inbox_humano") {
         qb = qb.or("human_taken_over.is.true,flow_status.ilike.human");
       } else if (part === "inbox_sesion_no_activa") {
@@ -626,7 +659,7 @@ async function fetchChatConversationsUnsafe(
         qb = qb.or(
           "flow_status.is.null," +
             "and(flow_status.not.ilike.bot,flow_status.not.ilike.active,flow_status.not.ilike.running)," +
-            (flowTokens.length > 0 ? `flow_code.is.null,flow_code.not.in.(${flowTokens.join(",")})` : "flow_code.is.null,flow_code.not.is.null")
+            `flow_code.is.null,and(${catalogNoMatchAnd})`
         );
       }
     } else if (vista === "historial") {
@@ -736,7 +769,7 @@ async function fetchChatConversationsUnsafe(
    * y no se vuelve a filtrar en memoria.
    */
   const pageLimit =
-    (vista === "inbox" || vista === "bot") && !searchContactIds && filters?.page_limit
+    (vista === "inbox" || vista === "bot") && !searchContactIds && flowTokensSafe && filters?.page_limit
       ? Math.min(Math.max(Math.trunc(filters.page_limit), 50), 500)
       : null;
   const pageCursor = pageLimit ? sanitizeInboxCursor(filters?.cursor) : null;
@@ -786,14 +819,11 @@ async function fetchChatConversationsUnsafe(
         byId.set(id, rest);
       }
     }
-    const tsOf = (row: Record<string, unknown>) => {
-      const v = row.last_message_at;
-      const n = typeof v === "string" ? Date.parse(v) : NaN;
-      return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY;
-    };
+    /** Mismo orden que Postgres: last_message_at DESC NULLS LAST (clave en µs; "" = null), id DESC. */
     const merged = [...byId.values()].sort((a, b) => {
-      const d = tsOf(b) - tsOf(a);
-      if (d !== 0 && !Number.isNaN(d)) return d;
+      const ka = inboxTimestampSortKeySync(a.last_message_at);
+      const kb = inboxTimestampSortKeySync(b.last_message_at);
+      if (ka !== kb) return ka < kb ? 1 : -1;
       const ia = String(a.id);
       const ib = String(b.id);
       return ia < ib ? 1 : ia > ib ? -1 : 0;

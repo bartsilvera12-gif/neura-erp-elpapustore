@@ -77,11 +77,25 @@ type ChatMessage = {
 /** Tamaño de página del listado Inbox/Bot ("Cargar más"). */
 const INBOX_PAGE_SIZE = 200;
 
+/**
+ * Clave ordenable en microsegundos (precisión de Postgres; `Date.parse` recorta a ms).
+ * "" = sin fecha (va al final, como NULLS LAST).
+ */
+function tsSortKey(v: string | null | undefined): string {
+  if (!v) return "";
+  const m = /^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)$/.exec(v.trim());
+  if (!m) return "";
+  const frac = (m[2] ?? "").padEnd(6, "0");
+  if (m[3] === "Z" || /^\+00(:?00)?$/.test(m[3])) return `${m[1].replace(" ", "T")}.${frac}`;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? `${new Date(ms).toISOString().slice(0, 19)}.${frac}` : "";
+}
+
 /** Orden del listado: last_message_at DESC NULLS LAST, id DESC (igual que el servidor). */
 function isOlderThanCursor(c: InboxConversation, cursor: ChatInboxCursor): boolean {
-  const ta = c.last_message_at ? Date.parse(c.last_message_at) : Number.NEGATIVE_INFINITY;
-  const tc = cursor.last_message_at ? Date.parse(cursor.last_message_at) : Number.NEGATIVE_INFINITY;
-  if (ta !== tc) return ta < tc;
+  const ka = tsSortKey(c.last_message_at);
+  const kc = tsSortKey(cursor.last_message_at);
+  if (ka !== kc) return ka < kc;
   return c.id < cursor.id;
 }
 
