@@ -86,6 +86,17 @@ const WH_MSG = "[webhooks/whatsapp][insert_message]";
 const WH_FLOW = "[webhooks/whatsapp][flow_session]";
 const WH_STATUS = "[whatsapp-status]";
 
+/**
+ * Claim gate contra duplicación por reintentos de Meta. Meta reintenta el webhook si tarda,
+ * y el chequeo `messageExists()` (SELECT sin lock) deja pasar reintentos paralelos → el motor
+ * corre 2-5 veces → el cliente recibe la bienvenida/combos duplicados.
+ * Con el gate activo, el early-persist (INSERT idempotente sobre `wa_message_id`) decide:
+ * el que gana el insert procesa; el que pierde (`duplicate`) es un reintento y NO ejecuta el motor.
+ * `WEBHOOK_CLAIM_GATE_ENABLED=false` lo desactiva (rollback instantáneo, sin deploy).
+ * (Portado de Mevo.)
+ */
+const WEBHOOK_CLAIM_GATE_ENABLED = process.env.WEBHOOK_CLAIM_GATE_ENABLED !== "false";
+
 function contactNameForWa(
   contacts: MetaWebhookValue["contacts"],
   waId: string
@@ -262,16 +273,21 @@ function extractMetaButtonId(msg: MetaInboundMessage): string | null {
   return null;
 }
 
+/**
+ * ¿Ya está guardado este wa_message_id? `error` != null si la LECTURA falló: antes se tomaba
+ * como "no existe" y un corte de Supabase podía reprocesar un mensaje ya guardado.
+ */
 async function messageExists(
   supabase: SupabaseAdmin,
   waMessageId: string
-): Promise<boolean> {
-  const { data } = await supabase
+): Promise<{ exists: boolean; error: string | null }> {
+  const { data, error } = await supabase
     .from("chat_messages")
     .select("id")
     .eq("wa_message_id", waMessageId)
     .maybeSingle();
-  return !!data?.id;
+  if (error) return { exists: false, error: error.message ?? "error" };
+  return { exists: !!data?.id, error: null };
 }
 
 type WhatsappChannelRow = {
@@ -681,7 +697,14 @@ export async function processInboundWebhookValue(
       continue;
     }
 
-    const messageAlreadyExists = await messageExists(supabase, waMid);
+    const existsCheck = await messageExists(supabase, waMid);
+    if (existsCheck.error && isTransientWebhookError(existsCheck.error)) {
+      // Supabase caído un momento: no sabemos si ya está guardado → cortar antes de escribir
+      // nada; el handler responde 503 y Meta reintenta. Otros errores siguen como antes.
+      errors.push(`Mensaje entrante (lectura): ${existsCheck.error}`);
+      continue;
+    }
+    const messageAlreadyExists = existsCheck.exists;
     let inboundMessageAlreadyPersisted = messageAlreadyExists;
     if (messageAlreadyExists) inboundDurableWrite = true;
 
@@ -841,7 +864,22 @@ export async function processInboundWebhookValue(
         if (early.ok || early.duplicate) {
           inboundMessageAlreadyPersisted = true;
           inboundDurableWrite = true;
-          console.info(WH_MSG, "early_inbound_persist_ok", {
+          // CLAIM GATE: si perdí el claim (otra invocación ya insertó este wa_message_id primero),
+          // esto es un reintento/duplicado de Meta → NO ejecutar el motor (evita bienvenida/combos
+          // duplicados). Se preservan las excepciones existentes: botones/lista (reprocesan routing
+          // de campañas) y comprobantes-media (tienen su propio dedup por image_received).
+          if (
+            WEBHOOK_CLAIM_GATE_ENABLED &&
+            !early.ok &&
+            early.duplicate &&
+            !mustRetryInboundRoutingDespiteDedupe &&
+            !isComprobanteMediaMessageKind(msg)
+          ) {
+            console.info("[claim][lost]", { conversationId, wa_mid: waMid, msgType: msgTypeInbound });
+            skipped += 1;
+            continue;
+          }
+          console.info(WH_MSG, early.ok ? "[claim][won]" : "early_inbound_persist_ok", {
             conversationId,
             wa_mid: waMid,
             duplicate: !early.ok,
