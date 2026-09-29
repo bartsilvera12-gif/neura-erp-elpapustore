@@ -102,7 +102,15 @@ export type ChatInboxFilters = {
    * conversaciones, sin importar cuán viejas sean.
    */
   search?: string | null;
+  /**
+   * Paginación por cursor (Inbox/Bot, sin búsqueda): tamaño de página y posición
+   * (last_message_at, id) de la última fila ya cargada. Sin `page_limit` se comporta como antes.
+   */
+  page_limit?: number | null;
+  cursor?: ChatInboxCursor | null;
 };
+
+export type ChatInboxCursor = { last_message_at: string | null; id: string };
 
 export type InboxConversation = {
   id: string;
@@ -159,7 +167,20 @@ export type ChatConversationsFetchResult = {
    * El listado principal no pudo leerse (p. ej. pool PG agotado). El cliente puede conservar datos previos en refetch silencioso.
    */
   transient_list_error?: boolean;
+  /** Cursor para "Cargar más" (null = no hay más; ausente = sin paginación). */
+  next_cursor?: ChatInboxCursor | null;
 };
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Valida el cursor que manda el cliente (se interpola en el filtro PostgREST). */
+function sanitizeInboxCursor(c: ChatInboxCursor | null | undefined): ChatInboxCursor | null {
+  if (!c || typeof c.id !== "string" || !UUID_RE.test(c.id.trim())) return null;
+  if (c.last_message_at == null) return { last_message_at: null, id: c.id.trim() };
+  const t = Date.parse(String(c.last_message_at));
+  if (!Number.isFinite(t)) return null;
+  return { last_message_at: new Date(t).toISOString(), id: c.id.trim() };
+}
 
 /**
  * Último mensaje por conversación en UNA consulta (LATERAL + LIMIT 1 por id, usa el índice
@@ -677,29 +698,48 @@ async function fetchChatConversationsUnsafe(
     return { builder: qb };
   };
 
+  /**
+   * Paginación por cursor: solo Inbox/Bot sin búsqueda (la búsqueda ya trae pocas filas).
+   * Orden estable (last_message_at DESC NULLS LAST, id DESC) + keyset; se pide una fila de más
+   * para saber si hay otra página. El cursor sale de las filas CRUDAS (antes del filtro exacto
+   * en memoria), así ninguna fila se saltea aunque una página quede con menos de `pageLimit`.
+   */
+  const pageLimit =
+    (vista === "inbox" || vista === "bot") && !searchContactIds && filters?.page_limit
+      ? Math.min(Math.max(Math.trunc(filters.page_limit), 50), 500)
+      : null;
+  const pageCursor = pageLimit ? sanitizeInboxCursor(filters?.cursor) : null;
+  const orderAndPage = (qq: any) => {
+    let r = qq.order("last_message_at", { ascending: false, nullsFirst: false });
+    if (!pageLimit) return r;
+    r = r.order("id", { ascending: false });
+    if (pageCursor) {
+      if (pageCursor.last_message_at) {
+        const ts = pageCursor.last_message_at;
+        r = r.or(
+          `last_message_at.lt."${ts}",and(last_message_at.eq."${ts}",id.lt.${pageCursor.id}),last_message_at.is.null`
+        );
+      } else {
+        r = r.is("last_message_at", null).lt("id", pageCursor.id);
+      }
+    }
+    return r.limit(pageLimit + 1);
+  };
+
   /* PostgREST: desempaquetar `.builder` — el builder es thenable y no puede devolverse solo desde async. */
   let q: any = (await buildFilteredConversationQuery(convSelectWithWait)).builder;
-  let { data: convs, error } = await q.order("last_message_at", {
-    ascending: false,
-    nullsFirst: false,
-  });
+  let { data: convs, error } = await orderAndPage(q);
 
   if (error && isMissingColumnError(error.message, "assignment_wait_code")) {
     console.warn("[fetchChatConversations] assignment_wait_code ausente; reintento sin columna");
     q = (await buildFilteredConversationQuery(convSelectLegacy)).builder;
-    ({ data: convs, error } = await q.order("last_message_at", {
-      ascending: false,
-      nullsFirst: false,
-    }));
+    ({ data: convs, error } = await orderAndPage(q));
   }
 
   if (error) {
     console.warn("[fetchChatConversations] reintento select mínimo sin priority ni assignment_wait_code");
     q = (await buildFilteredConversationQuery(convSelectLegacyNoPriority)).builder;
-    ({ data: convs, error } = await q.order("last_message_at", {
-      ascending: false,
-      nullsFirst: false,
-    }));
+    ({ data: convs, error } = await orderAndPage(q));
   }
 
   if (error) {
@@ -707,6 +747,19 @@ async function fetchChatConversationsUnsafe(
     throw new Error(`[fetchChatConversations] listado conversaciones: ${error.message}`);
   }
   let list = (convs ?? []) as Record<string, unknown>[];
+  let nextCursor: ChatInboxCursor | null | undefined = undefined;
+  if (pageLimit) {
+    const hasMore = list.length > pageLimit;
+    if (hasMore) list = list.slice(0, pageLimit);
+    const lastRaw = list[list.length - 1] as { id?: unknown; last_message_at?: unknown } | undefined;
+    nextCursor =
+      hasMore && lastRaw && typeof lastRaw.id === "string"
+        ? {
+            id: lastRaw.id,
+            last_message_at: typeof lastRaw.last_message_at === "string" ? lastRaw.last_message_at : null,
+          }
+        : null;
+  }
   const totalAfterQuery = list.length;
   console.info("[chat-list][fetch-result]", {
     source: "postgrest",
@@ -939,7 +992,7 @@ async function fetchChatConversationsUnsafe(
   }
 
   if (list.length === 0) {
-    return { conversations: [], base_row_count: totalAfterQuery };
+    return { conversations: [], base_row_count: totalAfterQuery, next_cursor: nextCursor };
   }
 
   const convIdList = list.map((row) => String((row as { id?: unknown }).id ?? "").trim()).filter(Boolean);
@@ -1212,7 +1265,7 @@ async function fetchChatConversationsUnsafe(
       awaiting_client_reply_since: clientTurnById[row.id as string] ?? null,
     };
   });
-  return { conversations: mapped, base_row_count: totalAfterQuery };
+  return { conversations: mapped, base_row_count: totalAfterQuery, next_cursor: nextCursor };
 }
 
 /** True si la empresa tiene al menos un flujo de chat activo (tab Bot en inbox). */

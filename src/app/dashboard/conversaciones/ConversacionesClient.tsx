@@ -26,6 +26,7 @@ import {
   type ChatInboxFilters,
   type ConversacionesVista,
   type InboxConversation,
+  type ChatInboxCursor,
 } from "@/lib/chat/actions";
 import {
   assignConversationToAgent,
@@ -72,6 +73,31 @@ type ChatMessage = {
   created_at: string;
   raw_payload?: Record<string, unknown> | null;
 };
+
+/** Tamaño de página del listado Inbox/Bot ("Cargar más"). */
+const INBOX_PAGE_SIZE = 200;
+
+/** Orden del listado: last_message_at DESC NULLS LAST, id DESC (igual que el servidor). */
+function isOlderThanCursor(c: InboxConversation, cursor: ChatInboxCursor): boolean {
+  const ta = c.last_message_at ? Date.parse(c.last_message_at) : Number.NEGATIVE_INFINITY;
+  const tc = cursor.last_message_at ? Date.parse(cursor.last_message_at) : Number.NEGATIVE_INFINITY;
+  if (ta !== tc) return ta < tc;
+  return c.id < cursor.id;
+}
+
+/**
+ * Filas ya cargadas con "Cargar más" que quedan por debajo de la 1ª página recién refrescada.
+ * Si el refresco dice que no hay más páginas (cursor null), la 1ª página ya cubre todo.
+ */
+function tailOlderThanCursor(
+  loaded: InboxConversation[],
+  firstPage: InboxConversation[],
+  cursor: ChatInboxCursor | null
+): InboxConversation[] {
+  if (!cursor || loaded.length <= firstPage.length) return [];
+  const inPage = new Set(firstPage.map((c) => c.id));
+  return loaded.filter((c) => !inPage.has(c.id) && isOlderThanCursor(c, cursor));
+}
 
 function isHumanContactName(name: string | null | undefined, phone?: string | null): boolean {
   const v = (name ?? "").trim();
@@ -378,6 +404,13 @@ export function ConversacionesClient({
 
   const [conversations, setConversations] = useState<InboxConversation[]>([]);
   const conversationsRef = useRef<InboxConversation[]>([]);
+  /** Paginación "Cargar más" (Inbox/Bot sin búsqueda): cursor de la próxima página, null = no hay más. */
+  const [nextCursor, setNextCursor] = useState<ChatInboxCursor | null>(null);
+  const nextCursorRef = useRef<ChatInboxCursor | null>(null);
+  useEffect(() => {
+    nextCursorRef.current = nextCursor;
+  }, [nextCursor]);
+  const [loadingMore, setLoadingMore] = useState(false);
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
@@ -544,7 +577,9 @@ export function ConversacionesClient({
   /** Si el usuario está cerca del final, los mensajes nuevos hacen scroll; si subió a leer historial, no. */
   const stickBottomRef = useRef(true);
   const lastMessageIdRef = useRef<string | null>(null);
-  const loadConversationsRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(async () => {});
+  const loadConversationsRef = useRef<(opts?: { silent?: boolean; append?: boolean }) => Promise<void>>(
+    async () => {}
+  );
   /** Tras la primera carga visible del inbox, se permite el beep (evita sonido en hidratar inicial). */
   const inboxSoundPrimedRef = useRef(false);
   /** Dedupe de ids de mensaje entrante ya notificados con sonido. */
@@ -556,12 +591,24 @@ export function ConversacionesClient({
   const messagesSessionCacheRef = useRef<Map<string, ChatMessage[]>>(new Map());
 
   const loadConversations = useCallback(
-    async (opts?: { silent?: boolean }) => {
+    async (opts?: { silent?: boolean; append?: boolean }) => {
       const silent = opts?.silent ?? false;
+      const append = opts?.append ?? false;
       const sp = new URLSearchParams(searchParamsRef.current?.toString() ?? "");
       const baseFilters = parseInboxFilters(sp);
       const searchTerm = debouncedSearchRef.current.trim();
-      const filters = searchTerm ? { ...(baseFilters ?? {}), search: searchTerm } : baseFilters;
+      /** Inbox/Bot sin búsqueda van paginados de a INBOX_PAGE_SIZE; la búsqueda trae todo lo que matchea. */
+      const paged = (vista === "inbox" || vista === "bot") && !searchTerm;
+      if (append && (!paged || !nextCursorRef.current)) return;
+      const filters = searchTerm
+        ? { ...(baseFilters ?? {}), search: searchTerm }
+        : paged
+          ? {
+              ...(baseFilters ?? {}),
+              page_limit: INBOX_PAGE_SIZE,
+              cursor: append ? nextCursorRef.current : null,
+            }
+          : baseFilters;
       const previousCount = conversationsRef.current.length;
       if (silent) {
         chatListUiLog("refetch-start", {
@@ -577,7 +624,16 @@ export function ConversacionesClient({
           conversations: rows,
           base_row_count: baseRowCount,
           transient_list_error: transientListError,
+          next_cursor: responseCursor,
         } = await fetchChatConversations(vista, filters);
+        if (append) {
+          setConversations((prev) => {
+            const seen = new Set(prev.map((c) => c.id));
+            return [...prev, ...rows.filter((c) => !seen.has(c.id))];
+          });
+          setNextCursor(responseCursor ?? null);
+          return;
+        }
         if (silent) {
           chatListUiLog("refetch-result", {
             activeTab: vista,
@@ -617,7 +673,15 @@ export function ConversacionesClient({
             reason: silent ? "silent_replace" : "load",
             filters: filters ?? null,
           });
-          setConversations(rows);
+          const loadedTail =
+            silent && paged ? tailOlderThanCursor(conversationsRef.current, rows, responseCursor ?? null) : [];
+          if (loadedTail.length > 0) {
+            /** Refresco silencioso: renueva la 1ª página y conserva lo ya cargado con "Cargar más". */
+            setConversations([...rows, ...loadedTail]);
+          } else {
+            setConversations(rows);
+            setNextCursor(paged ? (responseCursor ?? null) : null);
+          }
         }
         if (!silent && previousCount === 0) {
           chatListUiLog("initial-data", {
@@ -821,6 +885,16 @@ export function ConversacionesClient({
   }, []);
 
   loadConversationsRef.current = loadConversations;
+
+  const loadMoreConversations = useCallback(async () => {
+    if (loadingMore || !nextCursorRef.current) return;
+    setLoadingMore(true);
+    try {
+      await loadConversationsRef.current?.({ silent: true, append: true });
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [loadingMore]);
 
   useEffect(() => {
     setSelectedId(null);
@@ -2681,109 +2755,123 @@ export function ConversacionesClient({
                 <p>Ningún chat coincide con la búsqueda</p>
               </div>
             ) : (
-              visibleConversations.map((c) => {
-                const hasNameInCard = isHumanContactName(c.contact.name, c.contact.phone_number);
-                const cardName = hasNameInCard ? c.contact.name!.trim() : "Sin nombre";
-                const cardInitial = (() => {
-                  const cleaned = cardName.replace(/^[^A-Za-z0-9]+/, "");
-                  const m = cleaned.match(/[A-Za-z0-9]/);
-                  return (m?.[0] ?? "?").toUpperCase();
-                })();
-                const isSelected = selectedId === c.id;
-                return (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => handleSelect(c.id)}
-                  className={`w-full text-left px-3 py-3 border-b border-slate-100 transition-colors ${
-                    isSelected ? "bg-white border-l-[3px] border-l-[#4FAEB2]" : "hover:bg-white"
-                  }`}
-                >
-                  <div className="flex items-start gap-2.5">
-                    <span
-                      aria-hidden="true"
-                      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[13px] font-semibold ${
-                        hasNameInCard
-                          ? "bg-[#4FAEB2]/12 text-[#3F8E91] border border-[#4FAEB2]/30"
-                          : "bg-slate-100 text-slate-500 border border-slate-200"
-                      }`}
-                    >
-                      {cardInitial}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold text-slate-900 truncate">
-                            {cardName}
+              <>
+                {visibleConversations.map((c) => {
+                  const hasNameInCard = isHumanContactName(c.contact.name, c.contact.phone_number);
+                  const cardName = hasNameInCard ? c.contact.name!.trim() : "Sin nombre";
+                  const cardInitial = (() => {
+                    const cleaned = cardName.replace(/^[^A-Za-z0-9]+/, "");
+                    const m = cleaned.match(/[A-Za-z0-9]/);
+                    return (m?.[0] ?? "?").toUpperCase();
+                  })();
+                  const isSelected = selectedId === c.id;
+                  return (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => handleSelect(c.id)}
+                    className={`w-full text-left px-3 py-3 border-b border-slate-100 transition-colors ${
+                      isSelected ? "bg-white border-l-[3px] border-l-[#4FAEB2]" : "hover:bg-white"
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <span
+                        aria-hidden="true"
+                        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[13px] font-semibold ${
+                          hasNameInCard
+                            ? "bg-[#4FAEB2]/12 text-[#3F8E91] border border-[#4FAEB2]/30"
+                            : "bg-slate-100 text-slate-500 border border-slate-200"
+                        }`}
+                      >
+                        {cardInitial}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-slate-900 truncate">
+                              {cardName}
+                            </div>
+                            <div className="text-[11px] text-slate-500 font-mono truncate tabular-nums">
+                              {contactPhoneFallback(c.contact.phone_number, c.contact.name)}
+                            </div>
                           </div>
-                          <div className="text-[11px] text-slate-500 font-mono truncate tabular-nums">
-                            {contactPhoneFallback(c.contact.phone_number, c.contact.name)}
+                          <div className="flex shrink-0 items-center gap-1">
+                            {vista === "bot" ? (
+                              <span className="text-[10px] font-semibold uppercase tracking-wide text-violet-700 bg-violet-50 border border-violet-200 px-1.5 py-0.5 rounded">
+                                Bot
+                              </span>
+                            ) : c.human_taken_over || c.flow_status === "human" ? (
+                              <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                                Humano
+                              </span>
+                            ) : null}
+                            {c.unread_count > 0 && (
+                              <span className="inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-[#4FAEB2] px-1.5 py-0.5 text-[11px] font-bold text-white">
+                                {c.unread_count}
+                              </span>
+                            )}
                           </div>
                         </div>
-                        <div className="flex shrink-0 items-center gap-1">
-                          {vista === "bot" ? (
-                            <span className="text-[10px] font-semibold uppercase tracking-wide text-violet-700 bg-violet-50 border border-violet-200 px-1.5 py-0.5 rounded">
-                              Bot
-                            </span>
-                          ) : c.human_taken_over || c.flow_status === "human" ? (
-                            <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
-                              Humano
-                            </span>
-                          ) : null}
-                          {c.unread_count > 0 && (
-                            <span className="inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-[#4FAEB2] px-1.5 py-0.5 text-[11px] font-bold text-white">
-                              {c.unread_count}
-                            </span>
-                          )}
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                          <ChannelBadge type={c.channel.type} nombre={c.channel.nombre} />
                         </div>
+                        <p className="mt-1.5 text-[12px] text-slate-500 truncate leading-snug">
+                          {c.last_message_preview || "—"}
+                        </p>
                       </div>
-                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                        <ChannelBadge type={c.channel.type} nombre={c.channel.nombre} />
-                      </div>
-                      <p className="mt-1.5 text-[12px] text-slate-500 truncate leading-snug">
-                        {c.last_message_preview || "—"}
-                      </p>
                     </div>
-                  </div>
-                  <div className="flex flex-wrap gap-1 mt-1.5">
-                    <span
-                      className={`text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${badgeEstadoClass(c.status)}`}
+                    <div className="flex flex-wrap gap-1 mt-1.5">
+                      <span
+                        className={`text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${badgeEstadoClass(c.status)}`}
+                      >
+                        {labelEstado(c.status)}
+                      </span>
+                      {c.queue_name ? (
+                        <span
+                          className="text-[9px] font-medium text-indigo-800 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded truncate max-w-full"
+                          title={`Cola: ${c.queue_name}`}
+                        >
+                          Cola · {c.queue_name}
+                        </span>
+                      ) : null}
+                      {vista !== "bot" ? <InboxReplyTurnBadges c={c} dense /> : null}
+                      {c.assigned_agent_name ? (
+                        <span
+                          className="text-[9px] font-semibold text-emerald-900 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded truncate max-w-full"
+                          title={`Agente asignado: ${c.assigned_agent_name}`}
+                        >
+                          Agente · {c.assigned_agent_name}
+                        </span>
+                      ) : (
+                        (() => {
+                          const w = assignmentWaitBadge(c.assignment_wait_code, Boolean(c.queue_id));
+                          return (
+                            <span
+                              className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border truncate max-w-full ${assignmentWaitBadgeClass(w.tone)}`}
+                              title="Sin agente asignado"
+                            >
+                              {w.label}
+                            </span>
+                          );
+                        })()
+                      )}
+                    </div>
+                  </button>
+                  );
+                })}
+                {nextCursor && !listSearch.trim() ? (
+                  <div className="p-3 text-center">
+                    <button
+                      type="button"
+                      onClick={() => void loadMoreConversations()}
+                      disabled={loadingMore}
+                      className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60"
                     >
-                      {labelEstado(c.status)}
-                    </span>
-                    {c.queue_name ? (
-                      <span
-                        className="text-[9px] font-medium text-indigo-800 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded truncate max-w-full"
-                        title={`Cola: ${c.queue_name}`}
-                      >
-                        Cola · {c.queue_name}
-                      </span>
-                    ) : null}
-                    {vista !== "bot" ? <InboxReplyTurnBadges c={c} dense /> : null}
-                    {c.assigned_agent_name ? (
-                      <span
-                        className="text-[9px] font-semibold text-emerald-900 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded truncate max-w-full"
-                        title={`Agente asignado: ${c.assigned_agent_name}`}
-                      >
-                        Agente · {c.assigned_agent_name}
-                      </span>
-                    ) : (
-                      (() => {
-                        const w = assignmentWaitBadge(c.assignment_wait_code, Boolean(c.queue_id));
-                        return (
-                          <span
-                            className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border truncate max-w-full ${assignmentWaitBadgeClass(w.tone)}`}
-                            title="Sin agente asignado"
-                          >
-                            {w.label}
-                          </span>
-                        );
-                      })()
-                    )}
+                      {loadingMore ? "Cargando…" : "Cargar más"}
+                    </button>
                   </div>
-                </button>
-                );
-              })
+                ) : null}
+              </>
             )}
           </div>
         </div>
