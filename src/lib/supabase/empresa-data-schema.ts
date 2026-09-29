@@ -6,6 +6,7 @@ import {
 } from "@/lib/supabase/schema";
 import { createServiceRoleClient } from "@/lib/supabase/service-admin";
 import { getSingleClientSchemaOrNull, isSingleClientMode } from "@/lib/instance/single-client";
+import { transientRetryFetch } from "@/lib/supabase/transient-retry-fetch";
 
 /**
  * Lee el schema operativo de la empresa.
@@ -48,6 +49,7 @@ export function createServiceRoleClientWithDbSchema(schema: string): AppSupabase
   return createClient(url, key, {
     auth: { autoRefreshToken: false, persistSession: false },
     db: { schema },
+    global: { fetch: transientRetryFetch },
   }) as AppSupabaseClient;
 }
 

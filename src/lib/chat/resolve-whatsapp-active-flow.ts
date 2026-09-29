@@ -229,22 +229,71 @@ export async function syncWhatsappConversationFlowFromCatalog(
   return { flow_code: targetFlow, flow_current_node: firstNode, changed: true };
 }
 
-/** Fila en catálogo y activa (si no hay fila → false = flujo inexistente en catálogo). */
-export async function isFlowKnownAndActiveInCatalog(
+/**
+ * Resultado de una verificación contra el catálogo. `unknown` = la consulta FALLÓ (API caída un
+ * momento): no sabemos si el flujo/nodo es válido, y no hay que tratarlo como inválido.
+ */
+export type CatalogCheck = "yes" | "no" | "unknown";
+
+/** Fila en catálogo y activa. `unknown` si la consulta falló. */
+export async function checkFlowKnownAndActiveInCatalog(
   supabase: SupabaseAdmin,
   empresaId: string,
   flowCode: string
-): Promise<boolean> {
+): Promise<CatalogCheck> {
   const fc = flowCode.trim();
-  if (!fc) return false;
+  if (!fc) return "no";
   const { data, error } = await supabase
     .from("chat_flows")
     .select("activo")
     .eq("empresa_id", empresaId)
     .eq("flow_code", fc)
     .maybeSingle();
-  if (error || !data) return false;
-  return (data as { activo?: boolean }).activo === true;
+  if (error) {
+    console.warn(LOG, "flow_check_query_failed", { empresaId, flowCode: fc, message: error.message });
+    return "unknown";
+  }
+  if (!data) return "no";
+  return (data as { activo?: boolean }).activo === true ? "yes" : "no";
+}
+
+/** Fila en catálogo y activa (si no hay fila → false = flujo inexistente en catálogo). */
+export async function isFlowKnownAndActiveInCatalog(
+  supabase: SupabaseAdmin,
+  empresaId: string,
+  flowCode: string
+): Promise<boolean> {
+  return (await checkFlowKnownAndActiveInCatalog(supabase, empresaId, flowCode)) === "yes";
+}
+
+/** Nodo activo en ese flujo. `unknown` si la consulta falló. */
+export async function checkNodeActiveInFlow(
+  supabase: SupabaseAdmin,
+  empresaId: string,
+  flowCode: string,
+  nodeCode: string
+): Promise<CatalogCheck> {
+  const nc = nodeCode.trim();
+  const fc = flowCode.trim();
+  if (!fc || !nc) return "no";
+  const { data, error } = await supabase
+    .from("chat_flow_nodes")
+    .select("id")
+    .eq("empresa_id", empresaId)
+    .eq("flow_code", fc)
+    .eq("node_code", nc)
+    .eq("is_active", true)
+    .maybeSingle();
+  if (error) {
+    console.warn(LOG, "node_check_query_failed", {
+      empresaId,
+      flowCode: fc,
+      nodeCode: nc,
+      message: error.message,
+    });
+    return "unknown";
+  }
+  return (data as { id?: string } | null)?.id ? "yes" : "no";
 }
 
 /** Nodo activo en ese flujo. */
@@ -254,18 +303,7 @@ export async function isNodeActiveInFlow(
   flowCode: string,
   nodeCode: string
 ): Promise<boolean> {
-  const nc = nodeCode.trim();
-  const fc = flowCode.trim();
-  if (!fc || !nc) return false;
-  const { data, error } = await supabase
-    .from("chat_flow_nodes")
-    .select("id")
-    .eq("empresa_id", empresaId)
-    .eq("flow_code", fc)
-    .eq("node_code", nc)
-    .eq("is_active", true)
-    .maybeSingle();
-  return !error && Boolean((data as { id?: string } | null)?.id);
+  return (await checkNodeActiveInFlow(supabase, empresaId, flowCode, nodeCode)) === "yes";
 }
 
 /**

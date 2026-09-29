@@ -28,8 +28,8 @@ import { fetchChatChannelConfigForWebhookWakeKeywords } from "@/lib/chat/fetch-c
 import { maybeRestartForPurchaseIntent } from "@/lib/chat/flow-restart-intent";
 import {
   CONV_LOG,
-  isFlowKnownAndActiveInCatalog,
-  isNodeActiveInFlow,
+  checkFlowKnownAndActiveInCatalog,
+  checkNodeActiveInFlow,
   matchesConversationRestartKeyword,
   matchesHumanHandoffKeyword,
   restartWhatsappConversationToFlowStart,
@@ -1042,6 +1042,16 @@ export async function processInboundWebhookValue(
           let restartTrigger = "";
           let prefer: string | null = null;
 
+          /**
+           * Si la consulta al catálogo FALLA (API caída un momento) no se reinicia: antes una falla
+           * pasajera se leía como "nodo inválido" y reiniciaba el flujo en plena carga de datos,
+           * con sesión nueva — el cliente perdía lo ya cargado y el bot volvía a preguntar.
+           * Un nodo realmente inválido lo repara igual `sendCurrentFlowNode` al intentar enviarlo.
+           */
+          const flowCheck = fc ? await checkFlowKnownAndActiveInCatalog(supabase, empresaId, fc) : "no";
+          const nodeCheck =
+            fc && nc && flowCheck !== "no" ? await checkNodeActiveInFlow(supabase, empresaId, fc, nc) : "no";
+
           if (!fc) {
             mustRestart = true;
             restartTrigger = "missing_flow_code";
@@ -1049,7 +1059,7 @@ export async function processInboundWebhookValue(
               conversationId,
               detail: "missing_flow_code",
             });
-          } else if (!(await isFlowKnownAndActiveInCatalog(supabase, empresaId, fc))) {
+          } else if (flowCheck === "no") {
             mustRestart = true;
             restartTrigger = "inactive_flow_reassigned";
             prefer = null;
@@ -1058,7 +1068,7 @@ export async function processInboundWebhookValue(
               flow_code: fc,
               detail: "not_in_catalog_or_inactive",
             });
-          } else if (!nc || !(await isNodeActiveInFlow(supabase, empresaId, fc, nc))) {
+          } else if (!nc || nodeCheck === "no") {
             mustRestart = true;
             restartTrigger = "invalid_current_node";
             prefer = fc;
@@ -1066,6 +1076,14 @@ export async function processInboundWebhookValue(
               conversationId,
               flow_code: fc,
               flow_current_node: nc,
+            });
+          } else if (flowCheck === "unknown" || nodeCheck === "unknown") {
+            console.warn(CONV_LOG, "catalog_check_unknown_keep_pointer", {
+              conversationId,
+              flow_code: fc,
+              flow_current_node: nc,
+              flowCheck,
+              nodeCheck,
             });
           }
 

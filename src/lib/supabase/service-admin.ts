@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { SUPABASE_APP_SCHEMA, type AppSupabaseClient } from "@/lib/supabase/schema";
 import { isSingleClientMode, getSingleClientSchemaOrNull } from "@/lib/instance/single-client";
+import { transientRetryFetch } from "@/lib/supabase/transient-retry-fetch";
 
 /**
  * Cliente service role (servidor): webhooks, /r redirect, jobs.
@@ -22,5 +23,6 @@ export function createServiceRoleClient(): AppSupabaseClient {
   return createClient(url, key, {
     auth: { autoRefreshToken: false, persistSession: false },
     db: { schema },
+    global: { fetch: transientRetryFetch },
   }) as AppSupabaseClient;
 }
