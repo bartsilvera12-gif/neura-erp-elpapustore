@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import type { WebhookProvisionEnv } from "@/lib/chat/channel-provision";
 import { verifyMetaSignature } from "@/lib/chat/meta-signature";
 import { processWhatsAppWebhookBody } from "@/lib/chat/whatsapp-webhook-service";
+import { shouldAskMetaToRetry } from "@/lib/chat/webhooks/webhook-transient-error";
 
 export function getSupabaseAdminForWebhooks(): AppSupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -106,6 +107,16 @@ export async function handleWhatsAppWebhookPost(request: NextRequest): Promise<N
         processed: result.processed,
         skipped: result.skipped,
       });
+    }
+
+    // Falla pasajera sin nada guardado (Supabase/Cloudflare caído un momento): 503 para que
+    // Meta reintente. Con 200 el mensaje del cliente se perdía sin rastro.
+    if (shouldAskMetaToRetry(result)) {
+      console.warn("[webhooks/whatsapp][POST] falla pasajera: se pide reintento a Meta (503)");
+      return NextResponse.json(
+        { ok: false, retry: true, processed: result.processed, skipped: result.skipped },
+        { status: 503 }
+      );
     }
 
     return NextResponse.json({

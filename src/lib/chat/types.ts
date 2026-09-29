@@ -150,6 +150,12 @@ export type ProcessWebhookResult = {
   processed: number;
   skipped: number;
   errors: string[];
+  /**
+   * true si algún mensaje entrante ya quedó (o ya estaba) en chat_messages, o si se pasó el punto
+   * desde el que el flujo puede tener efectos (respuestas, CRM, sorteo). Con esto en true NO se le
+   * pide reintento a Meta: el reintento no repararía nada y podría repetir respuestas.
+   */
+  inboundDurableWrite?: boolean;
 };
 
 export type SupabaseAdmin = AppSupabaseClient;
