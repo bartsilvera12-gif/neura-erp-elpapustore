@@ -1269,13 +1269,12 @@ export function ConversacionesClient({
         if (idx < 0) {
           // Conversación no presente en la lista local. Solo si entra al universo
           // visible (open/pending, no oculta) vale la pena reconciliar.
-          // Y solo si puede pertenecer a la pestaña actual: en Inbox, un chat claramente
-          // de bot (sin humano, flow_status bot) no aparecería tras el refetch; en Bot, uno
-          // tomado por humano tampoco. Así la actividad del bot no recarga la Inbox sin parar.
+          // Y solo si puede pertenecer a la pestaña actual. El Papu: la Inbox son SOLO las
+          // escaladas a humano, así que una no humana nunca aparecería tras el refetch; en Bot,
+          // una tomada por humano tampoco. Así la actividad del bot no recarga la Inbox sin parar.
           const fs = typeof row.flow_status === "string" ? row.flow_status.trim().toLowerCase() : "";
           const human = row.human_taken_over === true || fs === "human";
-          const clearlyBot = !human && (fs === "bot" || fs === "active" || fs === "running");
-          const irrelevant = (vista === "inbox" && clearlyBot) || (vista === "bot" && human);
+          const irrelevant = (vista === "inbox" && !human) || (vista === "bot" && human);
           if (stillInScope && !hiddenByTag && !irrelevant) scheduleListRefetch(1500);
           return prev;
         }
@@ -1284,20 +1283,19 @@ export function ConversacionesClient({
           return prev.filter((c) => c.id !== id);
         }
         const cur = prev[idx];
-        // Cambio de pestaña visible al instante: en Bot, si la toma un humano; en Inbox, si una
-        // conversación humana vuelve al bot (liberada). Estados ambiguos esperan al próximo refetch.
+        // Cambio de pestaña visible al instante: en Bot, si la toma un humano; en Inbox (El Papu:
+        // solo humanas), en cuanto deja de ser humana (liberada al bot). El evento UPDATE trae la
+        // fila completa; si human_taken_over no viene explícito, se espera al próximo refetch.
         {
           const fsNow = typeof row.flow_status === "string" ? row.flow_status.trim().toLowerCase() : null;
           const humanNow =
             row.human_taken_over === true || fsNow === "human"
               ? true
-              : row.human_taken_over === false && fsNow != null && fsNow !== "human"
+              : row.human_taken_over === false
                 ? false
                 : null;
-          const wasHuman = cur.human_taken_over || String(cur.flow_status ?? "").toLowerCase() === "human";
           const leavesBot = vista === "bot" && humanNow === true;
-          const leavesInbox =
-            vista === "inbox" && wasHuman && humanNow === false && (fsNow === "bot" || fsNow === "active" || fsNow === "running");
+          const leavesInbox = vista === "inbox" && humanNow === false;
           if (leavesBot || leavesInbox) {
             return prev.filter((c) => c.id !== id);
           }
