@@ -429,6 +429,41 @@ async function findWhatsappChannelInTenantSchemas(
 }
 
 /**
+ * ¿El fallo al procesar un texto del flujo es transitorio (vale reintentar en el mismo request)?
+ * Bajo carga, el procesamiento del dato puede fallar por PostgREST/red; si se traga, el cliente
+ * queda mudo (la app responde 200 a Meta y Meta no reenvía). El reintento es seguro por el guard
+ * de idempotencia por wa_message_id dentro de processTextReply.
+ */
+function isTransientFlowTextFailure(status?: string, error?: string | null): boolean {
+  const st = (status ?? "").trim();
+  if (
+    st === "exception" ||
+    st === "save_text_failed" ||
+    st === "advance_failed" ||
+    st === "send_next_node_failed" ||
+    st === "idempotency_check_failed" ||
+    st === "duplicate_capture_resend_failed"
+  ) {
+    return true;
+  }
+  const msg = (error ?? "").toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes("schema cache") ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("fetch failed") ||
+    msg.includes("econn") ||
+    msg.includes("socket") ||
+    msg.includes("network") ||
+    msg.includes("503") ||
+    msg.includes("502") ||
+    msg.includes("500") ||
+    msg.includes("could not query the database")
+  );
+}
+
+/**
  * Procesa mensajes entrantes de un único `value` de Meta (un change).
  */
 export async function processInboundWebhookValue(
@@ -1967,19 +2002,80 @@ export async function processInboundWebhookValue(
                   : "not_captured_non_capture_node_presented",
               });
             } else {
-              const textResult = await flowEngine.processTextReply({
-                conversationId,
-                empresaId,
-                textValue: content,
-                rawPayload: msg as unknown as Record<string, unknown>,
-              });
+              /**
+               * Reintento in-request: si el procesamiento del texto falla por causa transitoria
+               * (lo que dejaba MUDO al cliente en un paso de captura) reintentamos hasta 3 veces con
+               * backoff. Seguro por el guard de idempotencia (wa_message_id) en processTextReply.
+               */
+              let textResult: Awaited<ReturnType<typeof flowEngine.processTextReply>> = {
+                ok: false,
+                status: "not_run",
+              };
+              let textAttempt = 0;
+              while (textAttempt < 3) {
+                textAttempt += 1;
+                try {
+                  textResult = await flowEngine.processTextReply({
+                    conversationId,
+                    empresaId,
+                    textValue: content,
+                    rawPayload: msg as unknown as Record<string, unknown>,
+                  });
+                } catch (e) {
+                  textResult = {
+                    ok: false,
+                    status: "exception",
+                    error: e instanceof Error ? e.message : String(e),
+                  };
+                }
+                if (
+                  textResult.ok ||
+                  textAttempt >= 3 ||
+                  !isTransientFlowTextFailure(textResult.status, textResult.error)
+                ) {
+                  break;
+                }
+                console.warn(logW, "flow_text_retry", {
+                  conversationId,
+                  attempt: textAttempt,
+                  status: textResult.status,
+                  error: textResult.error ?? null,
+                });
+                await new Promise((r) => setTimeout(r, 350 * textAttempt));
+              }
               console.info(logW, "flow_result: text", {
                 conversationId,
                 status: textResult.status,
                 nextNodeCode: textResult.nextNodeCode ?? null,
+                attempts: textAttempt,
               });
               if (!textResult.ok) {
                 errors.push(`Flow text: ${textResult.error ?? textResult.status}`);
+                /**
+                 * Deja rastro del fallo EN LA BASE (los logs de la app son efímeros). Best-effort:
+                 * nunca debe romper el webhook. Permite auditar la causa raíz del residual por SQL.
+                 */
+                try {
+                  await supabase.from("chat_flow_events").insert({
+                    empresa_id: empresaId,
+                    conversation_id: conversationId,
+                    flow_code: convFlow ?? null,
+                    node_code: convNode ?? null,
+                    event_type: "text_process_failed",
+                    payload: {
+                      status: textResult.status,
+                      error: textResult.error ?? null,
+                      wa_message_id: waMid,
+                      attempts: textAttempt,
+                      text_preview: content.slice(0, 40),
+                    },
+                  });
+                } catch (diagErr) {
+                  console.warn(logW, "text_process_failed_diag_insert_failed", {
+                    conversationId,
+                    err: diagErr instanceof Error ? diagErr.message : String(diagErr),
+                  });
+                }
               }
             }
           } else {

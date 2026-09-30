@@ -4000,6 +4000,40 @@ export function createFlowEngine(ctx: FlowEngineContext) {
       };
     }
 
+    /**
+     * Idempotencia por wa_message_id: si un intento anterior (reintento del webhook o reentrega de
+     * Meta) YA capturó este mismo mensaje entrante, NO recapturamos (recapturar podría guardar el
+     * dato en el campo equivocado si el puntero ya avanzó). Solo re-presentamos el nodo actual para
+     * no dejar mudo al cliente. Hace que reintentar processTextReply sea siempre seguro.
+     */
+    const inboundWaId =
+      typeof (params.rawPayload as { id?: unknown })?.id === "string"
+        ? String((params.rawPayload as { id?: string }).id).trim()
+        : "";
+    if (inboundWaId) {
+      const { data: dupCapture, error: dupErr } = await supabase
+        .from("chat_flow_events")
+        .select("id")
+        .eq("conversation_id", state.id)
+        .eq("flow_session_id", textFlowSid)
+        .eq("event_type", "text_captured")
+        .contains("payload", { raw: { id: inboundWaId } })
+        .limit(1);
+      if (dupErr) {
+        return { ok: false, status: "idempotency_check_failed", error: dupErr.message };
+      }
+      if (Array.isArray(dupCapture) && dupCapture.length > 0) {
+        const resent = await sendCurrentFlowNode({ conversationId: state.id });
+        return {
+          ok: resent.ok,
+          status: resent.ok
+            ? "duplicate_capture_represented"
+            : "duplicate_capture_resend_failed",
+          error: resent.ok ? undefined : resent.error,
+        };
+      }
+    }
+
     const sfCapture = currentNode.save_as_field.trim();
     const expectedNode = currentNode.node_code.trim();
 
