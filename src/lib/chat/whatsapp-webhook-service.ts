@@ -784,6 +784,11 @@ export async function processInboundWebhookValue(
 
     const displayName = contactNameForWa(value.contacts, from) ?? from;
 
+    /** Hoisted para el catch: permite re-presentar y registrar diagnóstico aunque la excepción
+     * ocurra en un paso intermedio (antes de llegar a processTextReply). */
+    let diagConversationId: string | null = null;
+    const diagIsTextMsg = String(msg.type ?? "").trim().toLowerCase() === "text";
+
     try {
       console.info(WH_CONTACT, "upsert_start", { empresaId, phone: from, useTenantPg });
       const { data: contact, error: cErr } = await supabase
@@ -867,6 +872,7 @@ export async function processInboundWebhookValue(
       }
 
       const conversationId = existingConv.id as string;
+      diagConversationId = conversationId;
 
       /**
        * Early-persist (single_client): guardar el inbound INMEDIATAMENTE (idempotente), antes de
@@ -2215,6 +2221,43 @@ export async function processInboundWebhookValue(
       processed += 1;
     } catch (e) {
       errors.push(e instanceof Error ? e.message : String(e));
+      /**
+       * Una excepción en cualquier paso intermedio del webhook (asignación, CRM, catálogo,
+       * intención de compra, present, etc.) abortaba el mensaje: quedaba guardado pero el motor
+       * nunca lo procesaba y el cliente quedaba MUDO en un paso de captura.
+       * Acá, best-effort (sin relanzar nunca):
+       *  (1) registramos el error EXACTO en la base para auditar qué paso rompe, y
+       *  (2) si es un texto, re-presentamos el nodo actual para que el cliente reciba la pregunta
+       *      vigente al instante en vez de quedar mudo. Re-presentar NO captura → no cruza datos.
+       */
+      if (diagConversationId) {
+        try {
+          await supabase.from("chat_flow_events").insert({
+            empresa_id: empresaId,
+            conversation_id: diagConversationId,
+            flow_code: null,
+            node_code: null,
+            event_type: "webhook_message_exception",
+            payload: {
+              error: e instanceof Error ? e.message : String(e),
+              stack: e instanceof Error ? (e.stack ?? "").slice(0, 600) : null,
+              wa_message_id: msg.id ?? null,
+              message_type: String(msg.type ?? ""),
+            },
+          });
+        } catch {
+          /* no-op */
+        }
+        if (diagIsTextMsg) {
+          try {
+            await createFlowEngine({ supabase }).sendCurrentFlowNode({
+              conversationId: diagConversationId,
+            });
+          } catch {
+            /* no-op */
+          }
+        }
+      }
     }
   }
 
