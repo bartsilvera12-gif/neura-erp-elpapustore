@@ -1702,6 +1702,34 @@ export async function processInboundWebhookValue(
       const skipFlowForBusinessAutomation =
         businessAutomationResult.sentAwayMessage && !interactiveInboundMetaId;
 
+      /**
+       * TRAMPA DE RUTEO: si un mensaje de TEXTO se desvía del manejador de texto (por away/horario
+       * o porque se detectó un botón interactivo en un texto), deja rastro en la base. Esto explica
+       * los mudos que no producen NINGÚN otro evento (ni processTextReply ni skip). Solo se graba en
+       * el caso desviado (bajo volumen). Best-effort.
+       */
+      if (message_type === "text" && (skipFlowForBusinessAutomation || interactiveInboundMetaId)) {
+        try {
+          await supabase.from("chat_flow_events").insert({
+            empresa_id: empresaId,
+            conversation_id: conversationId,
+            flow_code: convFlow ?? null,
+            node_code: convNode ?? null,
+            event_type: "text_routed_away_diag",
+            payload: {
+              wa_message_id: waMid,
+              skip_flow_business_automation: skipFlowForBusinessAutomation,
+              sent_away_message: businessAutomationResult.sentAwayMessage,
+              sent_welcome: businessAutomationResult.sentWelcome,
+              interactive_meta_id: interactiveInboundMetaId ?? null,
+              text_preview: content.slice(0, 40),
+            },
+          });
+        } catch {
+          /* no-op */
+        }
+      }
+
       console.info(logW, "conversation_updated_unread", { conversationId });
 
       let convDbAfterUnread: unknown = null;
