@@ -4071,6 +4071,9 @@ export function createFlowEngine(ctx: FlowEngineContext) {
           wa_message_id: waMessageIdFromRawPayload(params.rawPayload),
         },
       });
+      // En vez de dejar mudo al cliente, re-presentamos el nodo actual para que reciba la
+      // pregunta vigente al instante (no captura nada → no cruza datos).
+      await sendCurrentFlowNode({ conversationId: state.id }).catch(() => undefined);
       return { ok: true, status: "ignored_pointer_not_on_screen" };
     }
 
@@ -4123,6 +4126,10 @@ export function createFlowEngine(ctx: FlowEngineContext) {
           wa_message_id: waMessageIdFromRawPayload(params.rawPayload),
         },
       });
+      // El mensaje contestaba la pregunta anterior (llegó antes de que saliera la actual). En vez
+      // de dejar mudo al cliente, re-presentamos el nodo actual para que responda lo que corresponde
+      // ahora. No captura nada → no hay riesgo de cruzar datos.
+      await sendCurrentFlowNode({ conversationId: state.id }).catch(() => undefined);
       return { ok: true, status: "ignored_text_predates_question" };
     }
 
