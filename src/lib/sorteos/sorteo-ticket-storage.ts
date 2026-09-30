@@ -83,16 +83,35 @@ export async function downloadAssetIfExists(
   return { bytes, mime };
 }
 
+/**
+ * Esperas entre intentos de storage. El ticket fallaba con errores pasajeros de la API
+ * (30-sep: órdenes creadas con el ticket en "error" y el cliente sin su boleta); la subida
+ * es `upsert` a una ruta fija y la firma de URL no cambia nada, así que repetir es seguro.
+ */
+const TICKET_STORAGE_RETRY_DELAYS_MS: readonly number[] = [800, 2000];
+
 export async function uploadGeneratedTicketPng(
   supabase: AppSupabaseClient,
   path: string,
   png: Buffer
 ): Promise<{ error?: string }> {
-  const { error } = await supabase.storage
-    .from(SORTEO_TICKET_GENERATED_BUCKET)
-    .upload(path, png, { contentType: "image/png", upsert: true });
-  if (error) return { error: error.message };
-  return {};
+  let lastError = "";
+  for (let attempt = 0; attempt <= TICKET_STORAGE_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      console.warn("[sorteo-ticket] storage_upload_retry", { attempt, path, error: lastError.slice(0, 120) });
+      await new Promise((r) => setTimeout(r, TICKET_STORAGE_RETRY_DELAYS_MS[attempt - 1]));
+    }
+    try {
+      const { error } = await supabase.storage
+        .from(SORTEO_TICKET_GENERATED_BUCKET)
+        .upload(path, png, { contentType: "image/png", upsert: true });
+      if (!error) return {};
+      lastError = error.message || "upload_failed";
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { error: lastError || "upload_failed" };
 }
 
 export async function createSignedUrlForTicket(
@@ -100,11 +119,20 @@ export async function createSignedUrlForTicket(
   path: string,
   expiresSec: number
 ): Promise<{ url: string | null; error?: string }> {
-  const { data, error } = await supabase.storage
-    .from(SORTEO_TICKET_GENERATED_BUCKET)
-    .createSignedUrl(path, expiresSec);
-  if (error || !data?.signedUrl) {
-    return { url: null, error: error?.message ?? "signed_url_failed" };
+  let lastError = "";
+  for (let attempt = 0; attempt <= TICKET_STORAGE_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, TICKET_STORAGE_RETRY_DELAYS_MS[attempt - 1]));
+    }
+    try {
+      const { data, error } = await supabase.storage
+        .from(SORTEO_TICKET_GENERATED_BUCKET)
+        .createSignedUrl(path, expiresSec);
+      if (!error && data?.signedUrl) return { url: data.signedUrl };
+      lastError = error?.message ?? "signed_url_failed";
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
   }
-  return { url: data.signedUrl };
+  return { url: null, error: lastError || "signed_url_failed" };
 }

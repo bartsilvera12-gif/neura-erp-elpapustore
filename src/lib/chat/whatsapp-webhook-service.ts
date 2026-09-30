@@ -25,7 +25,11 @@ import {
 } from "@/lib/chat/conversation-send-context";
 import { attachInboundMessageMedia } from "@/lib/chat/inbound-media-attach";
 import { fetchChatChannelConfigForWebhookWakeKeywords } from "@/lib/chat/fetch-channel-config-webhook";
-import { maybeRestartForPurchaseIntent } from "@/lib/chat/flow-restart-intent";
+import {
+  maybeRestartForPurchaseIntent,
+  PAID_PURCHASE_PENDING_ORDER_REASON,
+} from "@/lib/chat/flow-restart-intent";
+import { findPaidPurchasePendingOrder, PAID_PURCHASE_RESUME_NOTICE } from "@/lib/chat/paid-purchase-guard";
 import {
   CONV_LOG,
   checkFlowKnownAndActiveInCatalog,
@@ -911,10 +915,27 @@ export async function processInboundWebhookValue(
       });
 
       console.info(WH_FLOW, "sync_catalog_before", { conversationId });
-      const syncedFlow = await syncWhatsappConversationFlowFromCatalog(supabase, empresaId, conversationId, {
-        flow_code: (existingConv as { flow_code?: string | null }).flow_code ?? null,
-        flow_current_node: (existingConv as { flow_current_node?: string | null }).flow_current_node ?? null,
-      });
+      /**
+       * Si la lectura del catálogo falla (API caída un momento) se sigue con el flujo y el paso que
+       * ya tenía la conversación. Antes la excepción abortaba el mensaje entero: quedaba guardado
+       * pero el motor nunca lo procesaba y el cliente se quedaba sin respuesta.
+       */
+      let syncedFlow: { flow_code: string | null; flow_current_node: string | null };
+      try {
+        syncedFlow = await syncWhatsappConversationFlowFromCatalog(supabase, empresaId, conversationId, {
+          flow_code: (existingConv as { flow_code?: string | null }).flow_code ?? null,
+          flow_current_node: (existingConv as { flow_current_node?: string | null }).flow_current_node ?? null,
+        });
+      } catch (e) {
+        console.warn(WH_FLOW, "sync_catalog_failed_keep_pointer", {
+          conversationId,
+          err: e instanceof Error ? e.message : String(e),
+        });
+        syncedFlow = {
+          flow_code: (existingConv as { flow_code?: string | null }).flow_code ?? null,
+          flow_current_node: (existingConv as { flow_current_node?: string | null }).flow_current_node ?? null,
+        };
+      }
       existingConv = {
         ...existingConv,
         flow_code: syncedFlow.flow_code,
@@ -935,6 +956,11 @@ export async function processInboundWebhookValue(
       let restartedThisMessage = false;
       /** Takeover por palabra/botón genérico: mensaje de confirmación tras persistir el entrante. */
       let keywordHandoffPendingConfirmation = false;
+      /**
+       * Se evitó reiniciar una compra YA PAGADA sin orden: este mensaje no es un dato del flujo;
+       * se le vuelve a mostrar al cliente el paso pendiente (ver `findPaidPurchasePendingOrder`).
+       */
+      let resumePaidPurchase = false;
 
       const restartKeywordMatch =
         message_type === "text"
@@ -944,11 +970,23 @@ export async function processInboundWebhookValue(
             })
           : false;
 
+      const paidPendingAtRestart =
+        restartKeywordMatch ? await findPaidPurchasePendingOrder(supabase, empresaId, conversationId) : null;
+      if (paidPendingAtRestart) {
+        resumePaidPurchase = !(convHuman || convFlowStatus === "human");
+        console.info(CONV_LOG, "restart_keyword_skipped_paid_purchase_pending_order", {
+          conversationId,
+          flow_session_id: paidPendingAtRestart.flowSessionId,
+          validation_id: paidPendingAtRestart.validationId,
+          resume: resumePaidPurchase,
+        });
+      }
+
       /**
        * Reinicio por palabra (hola, menú, iniciar…): debe aplicar también si el chat estaba en modo humano,
        * para poder volver al bot sin depender solo de conversaciones nuevas.
        */
-      if (restartKeywordMatch) {
+      if (restartKeywordMatch && !paidPendingAtRestart) {
         console.info(CONV_LOG, "restart_keyword_branch_entered", {
           conversationId,
           preferFlowCode: convFlow,
@@ -986,16 +1024,37 @@ export async function processInboundWebhookValue(
        * No sustituye al reinicio por hola/menú/iniciar (rama anterior). Si no hubo match ahí, evaluamos aquí.
        */
       if (!restartKeywordMatch && message_type === "text") {
-        const pi = await maybeRestartForPurchaseIntent(supabase, empresaId, conversationId, {
-          messageType: message_type,
-          content,
-          convFlow,
-          convNode,
-          convHuman,
-          convFlowStatus,
-          restartedThisMessage,
-          channelConfig: channelWakeConfig,
-        });
+        let pi: Awaited<ReturnType<typeof maybeRestartForPurchaseIntent>>;
+        try {
+          pi = await maybeRestartForPurchaseIntent(supabase, empresaId, conversationId, {
+            messageType: message_type,
+            content,
+            convFlow,
+            convNode,
+            convHuman,
+            convFlowStatus,
+            restartedThisMessage,
+            channelConfig: channelWakeConfig,
+            blockRestart: async () =>
+              Boolean(await findPaidPurchasePendingOrder(supabase, empresaId, conversationId)),
+          });
+        } catch (e) {
+          // Falla leyendo catálogo/config: no se reinicia y el mensaje sigue al motor como siempre.
+          console.warn(CONV_LOG, "purchase_intent_check_failed", {
+            conversationId,
+            err: e instanceof Error ? e.message : String(e),
+          });
+          pi = {
+            restarted: false,
+            flow_code: null,
+            flow_current_node: null,
+            new_flow_session_id: null,
+            reason: "check_failed",
+          };
+        }
+        if (pi.reason === PAID_PURCHASE_PENDING_ORDER_REASON) {
+          resumePaidPurchase = !(convHuman || convFlowStatus === "human");
+        }
         if (pi.restarted) {
           convFlow = pi.flow_code;
           convNode = pi.flow_current_node;
@@ -1171,39 +1230,58 @@ export async function processInboundWebhookValue(
       console.info("[webhooks/whatsapp][assignConversation]", useTenantPg ? "pg_v2" : "postgrest", {
         conversationId,
       });
-      const arCrm =
-        useTenantPg && pool
-          ? await assignConversationPg(pool, tenantDataSchema, conversationId)
-          : await assignConversation(supabase, conversationId);
-      if (!arCrm.ok) {
-        console.warn("[webhook/whatsapp][crm] assignConversation", arCrm.error);
-      }
-      if (pool) {
-        const crmPg = await ensureWhatsappInboundCrmLeadPg({
-          pool,
-          data_schema: tenantDataSchema,
-          empresa_id: empresaId,
-          contact_id: contactId,
-          conversation_id: conversationId,
-          channel_id: channelId,
-          first_message_preview: preview,
-        });
-        if (!crmPg.ok) {
-          errors.push(crmPg.error);
+      /**
+       * Asignación a asesor y lead de CRM son secundarios: si fallan (pool de Postgres saturado por
+       * las pantallas del ERP, API caída) se registra y el mensaje SIGUE al motor. Antes la
+       * excepción abortaba el mensaje entero y el cliente que respondía su dato no recibía nada.
+       */
+      try {
+        const arCrm =
+          useTenantPg && pool
+            ? await assignConversationPg(pool, tenantDataSchema, conversationId)
+            : await assignConversation(supabase, conversationId);
+        if (!arCrm.ok) {
+          console.warn("[webhook/whatsapp][crm] assignConversation", arCrm.error);
         }
-      } else {
-        const crmRes = await ensureWhatsappInboundCrmProspecto({
-          chatSupabase: supabase,
-          etapaSupabase: catalogSupabase,
-          empresaId,
-          contactId,
+      } catch (e) {
+        console.warn("[webhook/whatsapp][crm] assignConversation_exception_continue", {
           conversationId,
-          channelId,
-          firstMessagePreview: preview,
+          err: e instanceof Error ? e.message : String(e),
         });
-        if (!crmRes.ok) {
-          errors.push(crmRes.error);
+      }
+      try {
+        if (pool) {
+          const crmPg = await ensureWhatsappInboundCrmLeadPg({
+            pool,
+            data_schema: tenantDataSchema,
+            empresa_id: empresaId,
+            contact_id: contactId,
+            conversation_id: conversationId,
+            channel_id: channelId,
+            first_message_preview: preview,
+          });
+          if (!crmPg.ok) {
+            errors.push(crmPg.error);
+          }
+        } else {
+          const crmRes = await ensureWhatsappInboundCrmProspecto({
+            chatSupabase: supabase,
+            etapaSupabase: catalogSupabase,
+            empresaId,
+            contactId,
+            conversationId,
+            channelId,
+            firstMessagePreview: preview,
+          });
+          if (!crmRes.ok) {
+            errors.push(crmRes.error);
+          }
         }
+      } catch (e) {
+        console.warn("[webhook/whatsapp][crm] lead_exception_continue", {
+          conversationId,
+          err: e instanceof Error ? e.message : String(e),
+        });
       }
 
       const flowEngine = createFlowEngine({ supabase });
@@ -1734,6 +1812,20 @@ export async function processInboundWebhookValue(
             interactiveResult.status === "invalid_button_restart_intent" &&
             !restartedThisMessage &&
             !convHuman &&
+            convFlowStatus !== "human" &&
+            (await findPaidPurchasePendingOrder(supabase, empresaId, conversationId))
+          ) {
+            // Compra pagada sin orden: no se empieza otra; se repite el paso pendiente.
+            const resentInt = await flowEngine.sendCurrentFlowNode({ conversationId });
+            console.info(CONV_LOG, "interactive_restart_skipped_paid_purchase_pending_order", {
+              conversationId,
+              ok: resentInt.ok,
+              nodeCode: resentInt.nodeCode ?? null,
+            });
+          } else if (
+            interactiveResult.status === "invalid_button_restart_intent" &&
+            !restartedThisMessage &&
+            !convHuman &&
             convFlowStatus !== "human"
           ) {
             console.info(CONV_LOG, "interactive_purchase_intent_restart", {
@@ -1802,7 +1894,55 @@ export async function processInboundWebhookValue(
              * del gate). La pregunta ya salió con este envío: la próxima respuesta es la buena.
              */
             const skipBecauseJustPresented = Boolean(presentResult && presentResult.presentedNow);
-            if (skipAfterRestartKeyword) {
+            if (resumePaidPurchase && !skipBecauseJustPresented) {
+              /**
+               * Compra pagada sin orden: "Y mis boletas" / "Hola…" no es la respuesta al paso actual
+               * (no se guarda como cédula o celular) ni un motivo para empezar otra compra. Se avisa que
+               * el pago está recibido y se repite la pregunta pendiente para que termine y reciba sus boletas.
+               */
+              try {
+                const ctxNotice = await resolveOutboundTextContextFromConversationId(
+                  supabase,
+                  conversationId,
+                  empresaId
+                );
+                const sendNotice = await sendOutboundTextMessage(ctxNotice, PAID_PURCHASE_RESUME_NOTICE);
+                if (sendNotice.ok) {
+                  const nowN = new Date().toISOString();
+                  await supabase.from("chat_messages").insert({
+                    empresa_id: empresaId,
+                    conversation_id: conversationId,
+                    wa_message_id: sendNotice.waMessageId,
+                    from_me: true,
+                    sender_type: "system",
+                    automation_source: "flow_engine",
+                    message_type: "text",
+                    content: PAID_PURCHASE_RESUME_NOTICE,
+                    raw_payload: (sendNotice.raw ?? {}) as Record<string, unknown>,
+                  });
+                  await supabase
+                    .from("chat_conversations")
+                    .update({
+                      last_message_at: nowN,
+                      last_message_preview: PAID_PURCHASE_RESUME_NOTICE.slice(0, 280),
+                      updated_at: nowN,
+                    })
+                    .eq("id", conversationId);
+                }
+              } catch (e) {
+                console.warn(logW, "paid_purchase_resume_notice_failed", {
+                  conversationId,
+                  err: e instanceof Error ? e.message : String(e),
+                });
+              }
+              const resent = await flowEngine.sendCurrentFlowNode({ conversationId });
+              console.info(logW, "paid_purchase_resume_current_step", {
+                conversationId,
+                ok: resent.ok,
+                nodeCode: resent.nodeCode ?? null,
+                error: resent.error ?? null,
+              });
+            } else if (skipAfterRestartKeyword) {
               console.info(logW, "skip_text_flow_handler", {
                 conversationId,
                 reason: "mensaje_usado_como_reinicio_flujo_no_es_captura",

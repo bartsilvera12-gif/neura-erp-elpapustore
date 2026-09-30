@@ -193,6 +193,9 @@ async function isNodeCaptureSensitive(
   return false;
 }
 
+/** `reason` cuando el reinicio se canceló por una compra pagada que todavía no tiene orden. */
+export const PAID_PURCHASE_PENDING_ORDER_REASON = "paid_purchase_pending_order" as const;
+
 export type MaybeRestartForPurchaseIntentArgs = {
   messageType: string;
   content: string;
@@ -203,6 +206,11 @@ export type MaybeRestartForPurchaseIntentArgs = {
   restartedThisMessage: boolean;
   /** Config del canal (`chat_channels.config`) para keywords de despertar; si falta, defaults del sistema. */
   channelConfig?: Record<string, unknown> | null;
+  /**
+   * Se consulta sólo cuando ya se decidió reiniciar: si devuelve true el reinicio se cancela
+   * (p. ej. compra pagada sin orden todavía). Si falta, se reinicia como siempre.
+   */
+  blockRestart?: () => Promise<boolean>;
 };
 
 export type MaybeRestartForPurchaseIntentResult = {
@@ -303,6 +311,11 @@ export async function maybeRestartForPurchaseIntent(
       node_code: args.convNode,
     });
     return noop("sensitive_capture_soft_blocked");
+  }
+
+  if (args.blockRestart && (await args.blockRestart())) {
+    console.info(LOG, "skip_paid_purchase_pending_order", { conversationId, matched, strong: isStrong });
+    return noop(PAID_PURCHASE_PENDING_ORDER_REASON);
   }
 
   const rr = await restartWhatsappConversationToFlowStart(supabase, empresaId, conversationId, {

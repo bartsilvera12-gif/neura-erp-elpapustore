@@ -23,6 +23,7 @@
     "qa:flow-answer-timing": "tsx scripts/qa-flow-answer-timing-unit.ts",
     "qa:supabase-transient-retry": "tsx scripts/qa-supabase-transient-retry-unit.ts",
     "qa:flow-session-ensure": "tsx scripts/qa-flow-session-ensure-unit.ts",
+    "qa:paid-purchase-guard": "tsx --conditions=react-server scripts/qa-paid-purchase-guard-unit.ts",
     "qa:sorteo-telefono-boleta": "tsx --conditions=react-server scripts/qa-sorteo-telefono-boleta-unit.ts",
     "verify:sorteo-integridad": "tsx scripts/verify-sorteo-integridad-nombre-monto.ts",
     "verify:flow-sessions": "tsx scripts/verify-flow-session-isolation.ts",
