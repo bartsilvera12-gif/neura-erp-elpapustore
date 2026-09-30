@@ -377,8 +377,6 @@ async function logBotTabClassificationSamplePostgrest(
   }
 }
 
-/** UUID imposible para forzar 0 resultados cuando la búsqueda no matcheó ningún contacto. */
-const IMPOSSIBLE_CONTACT_ID = "00000000-0000-0000-0000-000000000000";
 const CONTACT_SEARCH_ID_LIMIT = 500;
 
 /**
@@ -442,10 +440,31 @@ async function fetchChatConversationsUnsafe(
 
   const poolInbox = getChatPostgresPool();
   const useTenantPg = Boolean(poolInbox && isLikelyUnexposedTenantChatSchema(dataSchema));
-  const scopeLog = await getOmnicanalScope(supabase, empresa_id, usuario_id, {
-    tenantDataSchema: dataSchema,
-  });
-  const bypassLog = await shouldBypassOmnicanalConversationScope(catalogSr, usuario_id, scopeLog);
+  /**
+   * Latencia: la base está en otra región (~0,1-0,25 s por consulta). Alcance omnicanal, flujos
+   * activos y contactos de la búsqueda no dependen entre sí: van en paralelo en vez de en fila.
+   */
+  const searchTerm = (filters?.search ?? "").trim();
+  const scopePromise = (async () => {
+    const scope = await getOmnicanalScope(supabase, empresa_id, usuario_id, {
+      tenantDataSchema: dataSchema,
+    });
+    const bypass = await shouldBypassOmnicanalConversationScope(catalogSr, usuario_id, scope);
+    return { scope, bypass };
+  })();
+  // Promise.resolve arranca la consulta ya (el builder de PostgREST no corre hasta que alguien lo espera).
+  const activeFlowsPromise = useTenantPg
+    ? null
+    : Promise.resolve(
+        supabase.from("chat_flows").select("id, flow_code, label").eq("empresa_id", empresa_id).eq("activo", true)
+      );
+  const searchIdsPromise =
+    !useTenantPg && searchTerm.length >= 3
+      ? resolveContactIdsForSearchPostgrest(supabase, empresa_id, searchTerm)
+      : null;
+  // Si salimos antes de esperarla (p. ej. pestaña Bot sin flujos activos), que no quede un rechazo sin manejar.
+  searchIdsPromise?.catch(() => undefined);
+  const { scope: scopeLog, bypass: bypassLog } = await scopePromise;
   const ts = new Date().toISOString();
   console.info("[chat-list][fetch-start]", {
     vista,
@@ -498,11 +517,7 @@ async function fetchChatConversationsUnsafe(
     return result;
   }
 
-  const { data: activeFlowRows, error: activeFlowsErr } = await supabase
-    .from("chat_flows")
-    .select("id, flow_code, label")
-    .eq("empresa_id", empresa_id)
-    .eq("activo", true);
+  const { data: activeFlowRows, error: activeFlowsErr } = await activeFlowsPromise!;
   if (activeFlowsErr) {
     console.warn("[fetchChatConversations] chat_flows activos:", activeFlowsErr.message);
   }
@@ -518,11 +533,11 @@ async function fetchChatConversationsUnsafe(
    * filtramos las conversaciones por esos `contact_id`. Esto evita el tope ~1000 del listado
    * (sólo trae los pocos matches). Si no matchea ningún contacto, forzamos 0 resultados.
    */
-  const searchTerm = (filters?.search ?? "").trim();
   let searchContactIds: string[] | null = null;
-  if (searchTerm.length >= 3) {
-    searchContactIds = await resolveContactIdsForSearchPostgrest(supabase, empresa_id, searchTerm);
-    if (searchContactIds.length === 0) searchContactIds = [IMPOSSIBLE_CONTACT_ID];
+  if (searchIdsPromise) {
+    searchContactIds = await searchIdsPromise;
+    /** Ningún contacto coincide: la respuesta es "sin resultados" sin armar el listado ni enriquecerlo. */
+    if (searchContactIds.length === 0) return { conversations: [], base_row_count: 0 };
   }
 
   /**
@@ -677,10 +692,9 @@ async function fetchChatConversationsUnsafe(
       qb = qb.in("contact_id", searchContactIds);
     }
 
-    const scope = await getOmnicanalScope(supabase, empresa_id, usuario_id, {
-      tenantDataSchema: dataSchema,
-    });
-    const bypass = await shouldBypassOmnicanalConversationScope(catalogSr, usuario_id, scope);
+    /** Mismo alcance que ya se resolvió al inicio de este pedido (antes se pedía de nuevo por cada parte). */
+    const scope = scopeLog;
+    const bypass = bypassLog;
     try {
       if (!bypass) {
         const { builder } = await appendOmnicanalConversationScopeToQuery(
@@ -887,13 +901,20 @@ async function fetchChatConversationsUnsafe(
   ];
   const flowSessionById = new Map<string, FlowSessionRowMin>();
   const sessionChunk = 100;
-  for (let i = 0; i < sessionIds.length; i += sessionChunk) {
-    const chunk = sessionIds.slice(i, i + sessionChunk);
-    const { data: sessRows, error: sessErr } = await supabase
-      .from("chat_flow_sessions")
-      .select("id, status, flow_code, conversation_id")
-      .eq("empresa_id", empresa_id)
-      .in("id", chunk);
+  const sessionChunks: string[][] = [];
+  for (let i = 0; i < sessionIds.length; i += sessionChunk) sessionChunks.push(sessionIds.slice(i, i + sessionChunk));
+  const sessionResults = await Promise.all(
+    sessionChunks.map((chunk) =>
+      Promise.resolve(
+        supabase
+          .from("chat_flow_sessions")
+          .select("id, status, flow_code, conversation_id")
+          .eq("empresa_id", empresa_id)
+          .in("id", chunk)
+      )
+    )
+  );
+  for (const { data: sessRows, error: sessErr } of sessionResults) {
     if (sessErr) {
       console.warn("[fetchChatConversations] chat_flow_sessions:", sessErr.message);
       continue;
@@ -1108,6 +1129,11 @@ async function fetchChatConversationsUnsafe(
   const convIdList = list.map((row) => String((row as { id?: unknown }).id ?? "").trim()).filter(Boolean);
   const awaitingById: Record<string, string | null> = {};
   const clientTurnById: Record<string, string | null> = {};
+  /**
+   * Enriquecimiento en paralelo: tiempos de espera, canales, colas, agentes (+ usuarios) y contactos
+   * no dependen entre sí. Antes iban uno detrás del otro (~0,1-0,25 s cada consulta a la base remota).
+   */
+  const awaitingTask = (async () => {
   if (convIdList.length > 0) {
     try {
       const { data: rpcRows, error: rpcErr } = await catalogSr.rpc("neura_inbox_awaiting_reply_since_batch", {
@@ -1146,6 +1172,7 @@ async function fetchChatConversationsUnsafe(
       else clientTurnById[id] = last.created_at;
     }
   }
+  })();
 
   const channelIds = [
     ...new Set(
@@ -1164,6 +1191,7 @@ async function fetchChatConversationsUnsafe(
       quick_replies_inbox_enabled: boolean;
     }
   > = {};
+  const channelsTask = (async () => {
   if (channelIds.length > 0) {
     const { data: chrows, error: chErr } = await supabase
       .from("chat_channels")
@@ -1203,6 +1231,7 @@ async function fetchChatConversationsUnsafe(
       );
     }
   }
+  })();
 
   const queueIds = [
     ...new Set(
@@ -1220,6 +1249,7 @@ async function fetchChatConversationsUnsafe(
   ];
 
   let queueNombreById: Record<string, string | null> = {};
+  const queuesTask = (async () => {
   if (queueIds.length > 0) {
     const { data: qrows, error: qErr } = await supabase
       .from("chat_queues")
@@ -1234,8 +1264,11 @@ async function fetchChatConversationsUnsafe(
       );
     }
   }
+  })();
 
   let agentUsuarioById: Record<string, string> = {};
+  let usuarioNombreById: Record<string, { nombre: string | null; email: string | null }> = {};
+  const agentsTask = (async () => {
   if (assignedAgentIds.length > 0) {
     const { data: arows, error: aErr } = await supabase
       .from("chat_agents")
@@ -1251,36 +1284,6 @@ async function fetchChatConversationsUnsafe(
     }
   }
 
-  const contactIds = [
-    ...new Set(
-      list
-        .map((c) => (c.contact_id as string | null | undefined)?.trim())
-        .filter((x): x is string => Boolean(x && x.length > 0))
-    ),
-  ];
-  let byId: Record<string, Record<string, unknown>> = {};
-  if (contactIds.length > 0) {
-    const cchunk = 80;
-    for (let i = 0; i < contactIds.length; i += cchunk) {
-      const part = contactIds.slice(i, i + cchunk);
-      const { data: contacts, error: e2 } = await supabase
-        .from("chat_contacts")
-        .select("id, name, phone_number, cliente_id, crm_prospecto_id")
-        .eq("empresa_id", empresa_id)
-        .in("id", part);
-      if (e2) {
-        console.warn("[fetchChatConversations] chat_contacts:", e2.message, {
-          chunk_index: i,
-          chunk_size: part.length,
-        });
-        continue;
-      }
-      for (const c of contacts ?? []) {
-        byId[c.id as string] = c as Record<string, unknown>;
-      }
-    }
-  }
-
   const agentUserIds = [
     ...new Set(
       list
@@ -1293,7 +1296,6 @@ async function fetchChatConversationsUnsafe(
     ),
   ];
 
-  let usuarioNombreById: Record<string, { nombre: string | null; email: string | null }> = {};
   if (agentUserIds.length > 0) {
     const { data: urows, error: uErr } = await catalogSr
       .from("usuarios")
@@ -1313,6 +1315,48 @@ async function fetchChatConversationsUnsafe(
       );
     }
   }
+  })();
+
+  const contactIds = [
+    ...new Set(
+      list
+        .map((c) => (c.contact_id as string | null | undefined)?.trim())
+        .filter((x): x is string => Boolean(x && x.length > 0))
+    ),
+  ];
+  const byId: Record<string, Record<string, unknown>> = {};
+  const contactsTask = (async () => {
+    if (contactIds.length === 0) return;
+    const cchunk = 80;
+    const starts: number[] = [];
+    for (let i = 0; i < contactIds.length; i += cchunk) starts.push(i);
+    const results = await Promise.all(
+      starts.map((i) =>
+        Promise.resolve(
+          supabase
+            .from("chat_contacts")
+            .select("id, name, phone_number, cliente_id, crm_prospecto_id")
+            .eq("empresa_id", empresa_id)
+            .in("id", contactIds.slice(i, i + cchunk))
+        ).then((r) => ({ i, ...r }))
+      )
+    );
+    for (const { i, data: contacts, error: e2 } of results) {
+      if (e2) {
+        console.warn("[fetchChatConversations] chat_contacts:", e2.message, {
+          chunk_index: i,
+          chunk_size: contactIds.slice(i, i + cchunk).length,
+        });
+        continue;
+      }
+      for (const c of contacts ?? []) {
+        byId[c.id as string] = c as Record<string, unknown>;
+      }
+    }
+  })();
+
+  await Promise.all([awaitingTask, channelsTask, queuesTask, agentsTask, contactsTask]);
+
 
   const mapped = list.map((row) => {
     const c = byId[row.contact_id as string] as
