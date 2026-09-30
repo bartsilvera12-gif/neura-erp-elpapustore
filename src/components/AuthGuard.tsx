@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useMemo } from "react";
 import { useRouter, usePathname } from "next/navigation";
-import { fetchWithSupabaseSession } from "@/lib/api/fetch-with-supabase-session";
+import { fetchModuleAccessShared } from "@/lib/modulos/module-access-client";
 import { getCurrentUser, getSession } from "@/lib/auth";
 import { isBootstrapSuperAdminEmail } from "@/lib/auth/super-admin-bootstrap-email";
 import {
@@ -48,9 +48,7 @@ function AuthGuardInner({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      const res = await fetchWithSupabaseSession("/api/empresas/module-access", {
-        cache: "no-store",
-      });
+      const acc = await fetchModuleAccessShared(session.user.id);
       if (cancelled) return;
 
       let superAdmin = false;
@@ -58,15 +56,15 @@ function AuthGuardInner({ children }: { children: React.ReactNode }) {
 
       const bootstrapSuper = isBootstrapSuperAdminEmail(session.user.email ?? null);
 
-      if (res.ok) {
-        const data = (await res.json()) as { superAdmin?: boolean; slugs?: string[] };
-        superAdmin = !!data.superAdmin || bootstrapSuper;
-        slugs = Array.isArray(data.slugs) ? data.slugs : [];
+      if (acc.ok) {
+        superAdmin = acc.superAdmin || bootstrapSuper;
+        slugs = acc.slugs;
       } else {
         superAdmin = bootstrapSuper;
       }
 
-      if (!superAdmin) {
+      // El servidor ya resolvió el rol (super_admin) en module-access: solo si falló se consulta aparte.
+      if (!superAdmin && !acc.ok) {
         try {
           const cu = await getCurrentUser();
           if ((cu?.rol ?? "").trim() === "super_admin") superAdmin = true;

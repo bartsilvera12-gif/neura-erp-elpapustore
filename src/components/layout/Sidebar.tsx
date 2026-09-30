@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 import type { Session } from "@supabase/supabase-js";
 import { fetchWithSupabaseSession } from "@/lib/api/fetch-with-supabase-session";
+import { fetchModuleAccessShared } from "@/lib/modulos/module-access-client";
 import { getCurrentUser } from "@/lib/auth";
 import { isBootstrapSuperAdminEmail } from "@/lib/auth/super-admin-bootstrap-email";
 import { supabase } from "@/lib/supabase";
@@ -419,7 +420,7 @@ export default function Sidebar() {
   useEffect(() => {
     let cancelled = false;
 
-    async function cargarMenuDesdeSesion(session: Session | null, silent: boolean) {
+    async function cargarMenuDesdeSesion(session: Session | null, silent: boolean, force = false) {
       try {
         if (!silent) setCargando(true);
         if (cancelled) return;
@@ -429,27 +430,23 @@ export default function Sidebar() {
           return;
         }
 
-        const res = await fetchWithSupabaseSession("/api/empresas/module-access", {
-          cache: "no-store",
-        });
+        // Misma respuesta que ya pidió AuthGuard (compartida); en login/logout se pide de nuevo.
+        const acc = await fetchModuleAccessShared(session.user.id, { force });
         if (cancelled) return;
 
         let superA = false;
         let modList: ModuloEmpresa[] = [];
         const bootstrapSuper = isBootstrapSuperAdminEmail(session.user.email ?? null);
 
-        if (res.ok) {
-          const body = (await res.json()) as {
-            superAdmin?: boolean;
-            modulos?: ModuloEmpresa[];
-          };
-          superA = !!body.superAdmin || bootstrapSuper;
-          modList = Array.isArray(body.modulos) ? body.modulos : [];
+        if (acc.ok) {
+          superA = acc.superAdmin || bootstrapSuper;
+          modList = acc.modulos as ModuloEmpresa[];
         } else {
           superA = bootstrapSuper;
         }
 
-        if (!superA) {
+        // El servidor ya resolvió el rol en module-access: solo si falló se consulta el usuario aparte.
+        if (!superA && !acc.ok) {
           try {
             const cu = await getCurrentUser();
             if ((cu?.rol ?? "").trim() === "super_admin") {
@@ -503,7 +500,7 @@ export default function Sidebar() {
       if (event === "TOKEN_REFRESHED" || event === "INITIAL_SESSION") return;
       // Cambios reales (login/logout/perfil): refrescamos. Si ya hicimos la carga
       // inicial, lo hacemos en modo silencioso para que el menú se mantenga visible.
-      void cargarMenuDesdeSesion(session, hasLoadedOnceRef.current);
+      void cargarMenuDesdeSesion(session, hasLoadedOnceRef.current, true);
     });
 
     return () => {
