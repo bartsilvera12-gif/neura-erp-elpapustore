@@ -61,24 +61,43 @@ export async function GET(
       return NextResponse.json(errorResponse(e3.message), { status: 400 });
     }
 
-    const { data: ordenesRows, error: e4 } = await sb
+    // Órdenes: count exacto (antes se traían las filas y se hacía .length, que PostgREST topa en
+    // 1000 → un revendedor con >1000 entradas quedaba clavado en 1000 y no se le contaban las ventas).
+    const { count: ordenesCount, error: e4 } = await sb
       .from("sorteo_entradas")
-      .select("id, monto_total, cantidad_boletos")
+      .select("id", { count: "exact", head: true })
       .eq("revendedor_id", revendedorId)
       .eq("empresa_id", empresaId);
     if (e4) {
       return NextResponse.json(errorResponse(e4.message), { status: 400 });
     }
+    const ordenes = ordenesCount ?? 0;
 
-    const ordenes = ordenesRows?.length ?? 0;
+    // Monto y cupones: SUM sobre TODAS las filas. No se puede con count → paginamos con .range()
+    // en lotes de 1000 hasta agotar, para no quedar topados (mismo bug que arriba pero en la suma).
     let monto_total = 0;
     let cupones = 0;
-    for (const r of ordenesRows ?? []) {
-      const row = r as { monto_total?: unknown; cantidad_boletos?: unknown };
-      const m = Number(row.monto_total);
-      if (Number.isFinite(m)) monto_total += m;
-      const c = Number(row.cantidad_boletos);
-      if (Number.isFinite(c) && c > 0) cupones += Math.trunc(c);
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data: pageRows, error: ePage } = await sb
+        .from("sorteo_entradas")
+        .select("monto_total, cantidad_boletos")
+        .eq("revendedor_id", revendedorId)
+        .eq("empresa_id", empresaId)
+        .order("id", { ascending: true })
+        .range(from, from + PAGE - 1);
+      if (ePage) {
+        return NextResponse.json(errorResponse(ePage.message), { status: 400 });
+      }
+      const rows = pageRows ?? [];
+      for (const r of rows) {
+        const row = r as { monto_total?: unknown; cantidad_boletos?: unknown };
+        const m = Number(row.monto_total);
+        if (Number.isFinite(m)) monto_total += m;
+        const c = Number(row.cantidad_boletos);
+        if (Number.isFinite(c) && c > 0) cupones += Math.trunc(c);
+      }
+      if (rows.length < PAGE) break;
     }
 
     const payload: RevendedorStatsPayload = {
