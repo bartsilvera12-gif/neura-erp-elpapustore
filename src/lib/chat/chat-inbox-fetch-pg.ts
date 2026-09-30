@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { awaitingReplyRpcAdmitsSchema } from "@/lib/chat/awaiting-reply-rpc";
 import {
   aggregateBotClassificationReasons,
   buildActiveFlowMatchSet,
@@ -647,7 +648,8 @@ export async function fetchChatConversationsFromTenantPg(
   const awaitingById: Record<string, string | null> = {};
   const clientTurnById: Record<string, string | null> = {};
   if (convIdList.length > 0) {
-    try {
+    // Fuera del allowlist de la función SQL la RPC siempre falla: ni se intenta (ver awaiting-reply-rpc).
+    if (awaitingReplyRpcAdmitsSchema(dataSchema)) try {
       const { data: rpcRows, error: rpcErr } = await catalogSr.rpc("neura_inbox_awaiting_reply_since_batch", {
         p_schema: dataSchema,
         p_empresa_id: empresa_id,
