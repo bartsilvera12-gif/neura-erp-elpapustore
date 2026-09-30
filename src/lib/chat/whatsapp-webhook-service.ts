@@ -294,6 +294,119 @@ async function messageExists(
   return { exists: !!data?.id, error: null };
 }
 
+/**
+ * Nodos de captura de dato donde un TEXTO del cliente ES la respuesta. Si un mensaje quedó guardado
+ * pero SIN procesar (la 1ª entrega murió a mitad por timeout bajo carga) y Meta lo reenvía, el dedupe
+ * normal lo descartaba y el cliente quedaba mudo. Acá lo recuperamos SOLO en estos nodos.
+ */
+const WHATSAPP_CAPTURE_NODE_CODES = new Set([
+  "cedula",
+  "primer_nombre",
+  "primer_apellido",
+  "ciudad",
+  "solicitud_de_nro_de_celular",
+  "nombre_y_apellido",
+]);
+
+/**
+ * Recuperación de "respuesta de captura perdida por reintento de Meta": cuando un texto YA existe
+ * (Meta reintenta) pero la conversación sigue parada en un nodo de captura y ESTE wa_message_id nunca
+ * se capturó, la 1ª entrega murió antes de procesar. Reprocesamos SOLO el motor de texto (no la
+ * bienvenida/reinicio → sin doble welcome). Idempotente y ultra-defensivo: ante cualquier duda
+ * devuelve false y el llamador hace el `skip` de siempre (comportamiento actual, cero riesgo nuevo).
+ */
+async function maybeRecoverUnprocessedCaptureText(params: {
+  supabase: SupabaseAdmin;
+  empresaId: string;
+  channelId: string;
+  fromPhone: string;
+  waMessageId: string;
+  textValue: string;
+  rawMsg: Record<string, unknown>;
+}): Promise<boolean> {
+  const { supabase, empresaId, channelId, fromPhone, waMessageId, textValue, rawMsg } = params;
+  try {
+    if (!textValue.trim()) return false;
+    const { data: contact } = await supabase
+      .from("chat_contacts")
+      .select("id")
+      .eq("empresa_id", empresaId)
+      .eq("phone_number", fromPhone)
+      .maybeSingle();
+    const contactId = (contact as { id?: string } | null)?.id;
+    if (!contactId) return false;
+    const { data: conv } = await supabase
+      .from("chat_conversations")
+      .select("id, flow_current_node, flow_status, human_taken_over, active_flow_session_id")
+      .eq("contact_id", contactId)
+      .eq("channel_id", channelId)
+      .maybeSingle();
+    const co = conv as
+      | {
+          id?: string;
+          flow_current_node?: string | null;
+          flow_status?: string | null;
+          human_taken_over?: boolean | null;
+          active_flow_session_id?: string | null;
+        }
+      | null;
+    if (!co?.id) return false;
+    // Solo en modo bot y parado en un nodo de captura.
+    if (co.human_taken_over || String(co.flow_status ?? "bot").toLowerCase() === "human") return false;
+    const node = String(co.flow_current_node ?? "").trim();
+    if (!WHATSAPP_CAPTURE_NODE_CODES.has(node)) return false;
+    // ¿Este mismo mensaje ya se capturó? (la 1ª entrega SÍ terminó) → no recuperar, dejar skip.
+    const sid = co.active_flow_session_id?.trim();
+    if (sid) {
+      const { data: already } = await supabase
+        .from("chat_flow_events")
+        .select("id")
+        .eq("conversation_id", co.id)
+        .eq("flow_session_id", sid)
+        .eq("event_type", "text_captured")
+        .contains("payload", { raw: { id: waMessageId } })
+        .limit(1);
+      if (Array.isArray(already) && already.length > 0) return false;
+    }
+    // Reprocesar SOLO el motor de texto (no reinicio/bienvenida). El guard de idempotencia por
+    // wa_message_id dentro de processTextReply es la segunda red de seguridad.
+    const flowEngine = createFlowEngine({ supabase });
+    const res = await flowEngine.processTextReply({
+      conversationId: co.id,
+      empresaId,
+      textValue,
+      rawPayload: rawMsg,
+    });
+    console.info("[webhooks/whatsapp]", "recovered_unprocessed_capture_text", {
+      conversationId: co.id,
+      node,
+      waMessageId,
+      status: res.status,
+      ok: res.ok,
+    });
+    try {
+      await supabase.from("chat_flow_events").insert({
+        empresa_id: empresaId,
+        conversation_id: co.id,
+        flow_code: null,
+        node_code: node,
+        flow_session_id: sid ?? null,
+        event_type: "recovered_capture_on_retry",
+        payload: { wa_message_id: waMessageId, status: res.status, ok: res.ok },
+      });
+    } catch {
+      /* no-op */
+    }
+    return true;
+  } catch (e) {
+    console.warn("[webhooks/whatsapp]", "recover_unprocessed_capture_text_failed", {
+      waMessageId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
+}
+
 type WhatsappChannelRow = {
   id: string;
   empresa_id: string;
@@ -766,6 +879,27 @@ export async function processInboundWebhookValue(
       !isComprobanteMediaMessageKind(msg) &&
       !mustRetryInboundRoutingDespiteDedupe
     ) {
+      /**
+       * CAUSA RAÍZ del "bot mudo": bajo carga la 1ª entrega guarda el mensaje pero muere a mitad de
+       * procesar (timeout → 499 en kong); Meta reenvía y este dedupe lo descartaba → cliente mudo.
+       * Antes de descartar, intentamos recuperar SOLO si es una respuesta de captura nunca procesada.
+       */
+      if (msgTypeInbound === "text") {
+        const { content: recContent } = extractMessageBody(msg);
+        const recovered = await maybeRecoverUnprocessedCaptureText({
+          supabase,
+          empresaId,
+          channelId,
+          fromPhone: from,
+          waMessageId: waMid,
+          textValue: recContent,
+          rawMsg: msg as unknown as Record<string, unknown>,
+        });
+        if (recovered) {
+          processed += 1;
+          continue;
+        }
+      }
       skipped += 1;
       continue;
     }
