@@ -2032,6 +2032,24 @@ export async function processInboundWebhookValue(
                   ? "Se acaba de enviar la pregunta del nodo actual; el mensaje es anterior a la pregunta y no se toma como respuesta"
                   : "Se acaba de enviar la UI del nodo actual (no es captura de texto); el mismo mensaje no se interpreta como dato del flujo",
               });
+              // Diagnóstico: registrar en la base para medir si esta rama es la que deja mudo.
+              try {
+                await supabase.from("chat_flow_events").insert({
+                  empresa_id: empresaId,
+                  conversation_id: conversationId,
+                  flow_code: convFlow ?? null,
+                  node_code: convNode ?? null,
+                  event_type: "text_skipped_just_presented_diag",
+                  payload: {
+                    wa_message_id: waMid,
+                    present_status: presentResult?.status ?? null,
+                    accepts_capture: presentResult?.acceptsInboundTextAsCapture ?? null,
+                    text_preview: content.slice(0, 40),
+                  },
+                });
+              } catch {
+                /* no-op */
+              }
               logFlowStateTransition({
                 conversationId,
                 flowSessionId: null,
@@ -2092,6 +2110,56 @@ export async function processInboundWebhookValue(
                 nextNodeCode: textResult.nextNodeCode ?? null,
                 attempts: textAttempt,
               });
+              /**
+               * Resultado del procesamiento del texto. Clasificamos:
+               *  - CAPTURA OK: se guardó y avanzó → nada que hacer.
+               *  - YA RE-PRESENTADO / carrera: processTextReply ya reenvió o el ganador enviará → nada.
+               *  - CUALQUIER OTRO (fallo, o "ignorado" silencioso): el cliente queda mudo si no
+               *    hacemos nada. Registramos el status EXACTO en la base (para auditar la causa) y
+               *    re-presentamos el nodo actual para que reciba la pregunta al instante. Re-presentar
+               *    NO captura → no cruza datos.
+               */
+              const CAPTURE_OK = new Set(["advanced", "captured_no_next_node"]);
+              const ALREADY_HANDLED = new Set([
+                "duplicate_capture_represented",
+                "ignored_pointer_not_on_screen",
+                "ignored_text_predates_question",
+                "ignored_concurrent_reply",
+                "image_expected_text_received",
+              ]);
+              if (!CAPTURE_OK.has(textResult.status) && !ALREADY_HANDLED.has(textResult.status)) {
+                try {
+                  await supabase.from("chat_flow_events").insert({
+                    empresa_id: empresaId,
+                    conversation_id: conversationId,
+                    flow_code: convFlow ?? null,
+                    node_code: convNode ?? null,
+                    event_type: "text_not_captured_diag",
+                    payload: {
+                      status: textResult.status,
+                      ok: textResult.ok,
+                      error: textResult.error ?? null,
+                      wa_message_id: waMid,
+                      attempts: textAttempt,
+                      present_status: presentResult?.status ?? null,
+                      presented_now: presentResult?.presentedNow ?? null,
+                      accepts_capture: presentResult?.acceptsInboundTextAsCapture ?? null,
+                      text_preview: content.slice(0, 40),
+                    },
+                  });
+                } catch (diagErr) {
+                  console.warn(logW, "text_not_captured_diag_insert_failed", {
+                    conversationId,
+                    err: diagErr instanceof Error ? diagErr.message : String(diagErr),
+                  });
+                }
+                // Fin del mute: re-presentar el nodo actual al instante.
+                try {
+                  await flowEngine.sendCurrentFlowNode({ conversationId });
+                } catch {
+                  /* no-op: el watchdog/barrido siguen como red final */
+                }
+              }
               if (!textResult.ok) {
                 errors.push(`Flow text: ${textResult.error ?? textResult.status}`);
                 /**
