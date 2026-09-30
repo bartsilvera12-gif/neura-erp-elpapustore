@@ -18,6 +18,8 @@ const SOURCE = "src/lib/sorteos/physical-coupons-print.ts";
 
 /** Máximo de cupones por una sola vista de impresión (evita timeouts). */
 export const PHYSICAL_COUPONS_PRINT_MAX = 8000;
+/** Tope de filas por respuesta de PostgREST en esta instancia (PGRST_DB_MAX_ROWS). */
+const POSTGREST_MAX_ROWS = 1000;
 
 export type PhysicalCouponPrintParams = {
   sorteoId: string;
@@ -415,6 +417,16 @@ async function fetchPhysicalCouponsPostgrest(
   }
 
   const list = (raw ?? []) as Record<string, unknown>[];
+  /**
+   * PostgREST corta en PGRST_DB_MAX_ROWS (1000) sin avisar: con exactamente ese tope puede haber
+   * más cupones. Mejor un error claro que imprimir una urna incompleta.
+   */
+  if (list.length === POSTGREST_MAX_ROWS) {
+    return {
+      data: [],
+      error: `No se pudieron leer todos los cupones (tope de ${POSTGREST_MAX_ROWS} por consulta). Imprimí por rango de cupones.`,
+    };
+  }
   if (list.length > PHYSICAL_COUPONS_PRINT_MAX) {
     return {
       data: [],
@@ -497,14 +509,12 @@ async function runFetch(
     return fetchPhysicalCouponsPgDirect(empresaId, dataSchema, f);
   }
 
-  /** Una entrada / tanda / rango / búsqueda con texto: SQL completo si hay pool. */
-  const prefersPgDirect =
-    Boolean(f.entradaId) ||
-    Boolean(f.entradaIds && f.entradaIds.length > 0) ||
-    f.cuponDesde != null ||
-    f.cuponHasta != null ||
-    Boolean(f.q?.trim());
-  if (prefersPgDirect && getChatPostgresPool()) {
+  /**
+   * Con pool, SIEMPRE SQL directo (una consulta, ciudad incluida). Por PostgREST "imprimir todos"
+   * quedaba cortado en silencio en 1000 filas (PGRST_DB_MAX_ROWS) y la ciudad se pedía con un
+   * `.in()` de cientos de ids en la URL (414/520 de Cloudflare: la pantalla quedaba colgada).
+   */
+  if (getChatPostgresPool()) {
     return fetchPhysicalCouponsPgDirect(empresaId, dataSchema, f);
   }
 
