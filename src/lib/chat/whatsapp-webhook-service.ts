@@ -1234,12 +1234,22 @@ export async function processInboundWebhookValue(
       };
 
       if (convFlow?.trim() && !convHuman && convFlowStatus !== "human") {
-        const ensuredSid = await ensureActiveFlowSessionForConversation(
-          supabase,
-          empresaId,
-          conversationId,
-          convFlow
-        );
+        let ensuredSid: string | null = null;
+        try {
+          ensuredSid = await ensureActiveFlowSessionForConversation(
+            supabase,
+            empresaId,
+            conversationId,
+            convFlow
+          );
+        } catch (e) {
+          // Rechazo transitorio de transporte (pool agotado / timeout / socket) NO debe abortar el
+          // mensaje: dejamos el puntero como está y el motor resuelve la sesión aguas abajo.
+          console.warn("[bot-routing]", "ensure_session_exception_keep_pointer", {
+            conversationId,
+            err: e instanceof Error ? e.message : String(e),
+          });
+        }
         console.info("[bot-routing]", "ensure_session_pre_assign", {
           conversationId,
           empresa_id: empresaId,
@@ -1327,14 +1337,23 @@ export async function processInboundWebhookValue(
 
       const flowEngine = createFlowEngine({ supabase });
 
-      const { data: convPersistSnap } = await supabase
-        .from("chat_conversations")
-        .select(
-          "flow_code, flow_current_node, flow_status, human_taken_over, unread_count, status"
-        )
-        .eq("id", conversationId)
-        .eq("empresa_id", empresaId)
-        .maybeSingle();
+      let convPersistSnap: unknown = null;
+      try {
+        ({ data: convPersistSnap } = await supabase
+          .from("chat_conversations")
+          .select(
+            "flow_code, flow_current_node, flow_status, human_taken_over, unread_count, status"
+          )
+          .eq("id", conversationId)
+          .eq("empresa_id", empresaId)
+          .maybeSingle());
+      } catch (e) {
+        // Rechazo transitorio: no abortar el mensaje; seguimos con el estado en memoria.
+        console.warn(logW, "conv_persist_snap_read_failed", {
+          conversationId,
+          err: e instanceof Error ? e.message : String(e),
+        });
+      }
 
       const snap =
         convPersistSnap as null | {
@@ -1620,11 +1639,20 @@ export async function processInboundWebhookValue(
       }
 
       {
-        const { data: chTok } = await supabase
-          .from("chat_channels")
-          .select("whatsapp_access_token")
-          .eq("id", channelId)
-          .maybeSingle();
+        let chTok: unknown = null;
+        try {
+          ({ data: chTok } = await supabase
+            .from("chat_channels")
+            .select("whatsapp_access_token")
+            .eq("id", channelId)
+            .maybeSingle());
+        } catch (e) {
+          // Rechazo transitorio leyendo el token: no abortar; cae al fallback de env.
+          console.warn(logW, "chat_channel_token_read_failed", {
+            conversationId,
+            err: e instanceof Error ? e.message : String(e),
+          });
+        }
         const rowTok =
           typeof (chTok as { whatsapp_access_token?: string } | null)?.whatsapp_access_token === "string"
             ? (chTok as { whatsapp_access_token: string }).whatsapp_access_token.trim()
@@ -1676,14 +1704,23 @@ export async function processInboundWebhookValue(
 
       console.info(logW, "conversation_updated_unread", { conversationId });
 
-      const { data: convDbAfterUnread } = await supabase
-        .from("chat_conversations")
-        .select(
-          "flow_code, flow_current_node, active_flow_session_id, flow_status, human_taken_over"
-        )
-        .eq("id", conversationId)
-        .eq("empresa_id", empresaId)
-        .maybeSingle();
+      let convDbAfterUnread: unknown = null;
+      try {
+        ({ data: convDbAfterUnread } = await supabase
+          .from("chat_conversations")
+          .select(
+            "flow_code, flow_current_node, active_flow_session_id, flow_status, human_taken_over"
+          )
+          .eq("id", conversationId)
+          .eq("empresa_id", empresaId)
+          .maybeSingle());
+      } catch (e) {
+        // Rechazo transitorio: no abortar el mensaje; seguimos con el estado en memoria.
+        console.warn(logW, "conv_db_after_unread_read_failed", {
+          conversationId,
+          err: e instanceof Error ? e.message : String(e),
+        });
+      }
       if (convDbAfterUnread) {
         const ec = existingConv as {
           flow_code?: string | null;
