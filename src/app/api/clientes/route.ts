@@ -29,21 +29,46 @@ async function buildPlanActivoMap(
   const map = new Map<string, string>();
   if (clienteIds.length === 0) return map;
 
-  const { data, error } = await supabase
-    .from("suscripciones")
-    .select("cliente_id, planes(nombre)")
-    .eq("empresa_id", empresaId)
-    .eq("estado", "activa")
-    .in("cliente_id", clienteIds)
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    console.error("[api/clientes] buildPlanActivoMap:", error.message);
-    return map;
+  // Con el listado completo, `.in(...)` con miles de uuids pasa el largo de URL del gateway
+  // (414/520): en ese caso se leen las suscripciones activas de la empresa por páginas.
+  // El shim Postgres directo (schemas no expuestos) no tiene ese límite ni implementa .range().
+  const wanted = new Set(clienteIds);
+  const data: Record<string, unknown>[] = [];
+  const base = () =>
+    supabase
+      .from("suscripciones")
+      .select("cliente_id, planes(nombre)")
+      .eq("empresa_id", empresaId)
+      .eq("estado", "activa");
+  const soportaRange = typeof (base() as { range?: unknown }).range === "function";
+  if (!soportaRange || clienteIds.length <= 100) {
+    const { data: rows, error } = await base()
+      .in("cliente_id", clienteIds)
+      .order("created_at", { ascending: false });
+    if (error) {
+      console.error("[api/clientes] buildPlanActivoMap:", error.message);
+      return map;
+    }
+    data.push(...((rows ?? []) as Record<string, unknown>[]));
+  } else {
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data: batch, error } = await base()
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(from, from + PAGE - 1);
+      if (error) {
+        console.error("[api/clientes] buildPlanActivoMap:", error.message);
+        return map;
+      }
+      data.push(...((batch ?? []) as Record<string, unknown>[]));
+      if ((batch ?? []).length < PAGE) break;
+    }
   }
 
-  for (const row of data ?? []) {
+  for (const row of data) {
     const cid = (row as { cliente_id: string }).cliente_id;
+    if (!wanted.has(cid)) continue;
     if (!map.has(cid)) {
       const planes = (row as { planes: { nombre: string } | { nombre: string }[] | null }).planes;
       const plan = Array.isArray(planes) ? planes[0] : planes;

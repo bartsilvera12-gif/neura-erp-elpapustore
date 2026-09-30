@@ -21,6 +21,10 @@ export type PerfilTributarioPublic = {
   obligaciones: { id: string; slug: string; nombre: string }[];
 };
 
+/** Hasta cuántos ids va en un `.in(...)` (~37 bytes por uuid: 100 ≈ 3,7 KB de URL). */
+const PERFIL_IN_MAX = 100;
+const PERFIL_PAGE = 1000;
+
 /** Solo para badge en listados: cliente_id → tiene perfil activo. */
 export async function fetchPerfilTributarioActivosMap(
   supabase: AppSupabaseClient,
@@ -30,20 +34,39 @@ export async function fetchPerfilTributarioActivosMap(
   const map = new Map<string, boolean>();
   if (clienteIds.length === 0) return map;
 
-  const { data, error } = await supabase
-    .from("cliente_perfil_tributario")
-    .select("cliente_id, perfil_activo")
-    .eq("empresa_id", empresaId)
-    .in("cliente_id", clienteIds);
-
-  if (error) {
-    console.error("[perfil tributario map]", error.message);
-    return map;
+  // Con muchos clientes (listado completo) el `.in(...)` arma una URL de decenas de KB: el gateway
+  // la corta (414 de Kong, o 520 de Cloudflare pasados ~16 KB). En ese caso se leen los perfiles de
+  // toda la empresa por páginas y se filtra acá; la tabla sólo tiene clientes con perfil cargado.
+  // El shim Postgres directo (schemas no expuestos) no tiene ese límite ni implementa .range().
+  const wanted = new Set(clienteIds);
+  const rows: { cliente_id?: string; perfil_activo?: boolean }[] = [];
+  const base = () =>
+    supabase.from("cliente_perfil_tributario").select("cliente_id, perfil_activo").eq("empresa_id", empresaId);
+  const soportaRange = typeof (base() as { range?: unknown }).range === "function";
+  if (!soportaRange || clienteIds.length <= PERFIL_IN_MAX) {
+    const { data, error } = await base().in("cliente_id", clienteIds);
+    if (error) {
+      console.error("[perfil tributario map]", error.message);
+      return map;
+    }
+    rows.push(...((data ?? []) as typeof rows));
+  } else {
+    for (let from = 0; ; from += PERFIL_PAGE) {
+      const { data, error } = await base()
+        .order("cliente_id", { ascending: true })
+        .range(from, from + PERFIL_PAGE - 1);
+      if (error) {
+        console.error("[perfil tributario map]", error.message);
+        return map;
+      }
+      const batch = (data ?? []) as typeof rows;
+      rows.push(...batch);
+      if (batch.length < PERFIL_PAGE) break;
+    }
   }
 
-  for (const row of data ?? []) {
-    const r = row as { cliente_id?: string; perfil_activo?: boolean };
-    if (typeof r.cliente_id === "string" && r.cliente_id) {
+  for (const r of rows) {
+    if (typeof r.cliente_id === "string" && r.cliente_id && wanted.has(r.cliente_id)) {
       map.set(r.cliente_id, r.perfil_activo === true);
     }
   }
