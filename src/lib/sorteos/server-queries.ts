@@ -1,4 +1,10 @@
-import type { SorteoCuponOrdenRow, SorteoEntrada, SorteoEntradaEstadoPago } from "@/lib/sorteos/types";
+import type {
+  SorteoCompradorCompraRow,
+  SorteoCompradorRankingRow,
+  SorteoCuponOrdenRow,
+  SorteoEntrada,
+  SorteoEntradaEstadoPago,
+} from "@/lib/sorteos/types";
 import {
   getChatPostgresPool,
   getChatPostgresConnectionString,
@@ -980,6 +986,321 @@ export function invalidateSorteosListCachesForEmpresa(empresaId: string, dataSch
   }
   for (const k of listInflight.keys()) {
     if (k.startsWith(p1) || k.startsWith(p2)) listInflight.delete(k);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ranking de compradores
+// ---------------------------------------------------------------------------
+
+/**
+ * Estados que cuentan como "compra real" en el ranking: la venta confirmada y la que está en
+ * revisión. Se excluyen `anulado` y `rechazado` (no son ventas) y `pendiente` (sin comprobante aún).
+ */
+const RANKING_ESTADOS: SorteoEntradaEstadoPago[] = ["confirmado", "pendiente_revision"];
+const RANKING_DEFAULT_LIMIT = 100;
+const RANKING_MAX_LIMIT = 500;
+/** Tope de filas al agregar en JS (solo path PostgREST; El Papu usa PG directo). */
+const RANKING_POSTGREST_SCAN_CAP = 10000;
+
+export type SorteoRankingParams = {
+  sorteoId?: string | null;
+  limit?: number;
+  q?: string | null;
+};
+
+export type SorteoRankingServerResult = {
+  data: SorteoCompradorRankingRow[];
+  error: string | null;
+  transient_error?: boolean;
+  /** true si el agregado JS alcanzó el tope y el ranking podría estar incompleto. */
+  truncated?: boolean;
+};
+
+export type SorteoCompradorComprasServerResult = {
+  data: SorteoCompradorCompraRow[];
+  error: string | null;
+  transient_error?: boolean;
+};
+
+function normalizeRankingLimit(raw?: number): number {
+  if (!Number.isFinite(raw) || !raw || raw <= 0) return RANKING_DEFAULT_LIMIT;
+  return Math.min(RANKING_MAX_LIMIT, Math.max(1, Math.floor(raw as number)));
+}
+
+async function fetchRankingPgDirect(
+  empresaId: string,
+  dataSchema: string,
+  sorteoId: string | null,
+  limit: number,
+  q: string | null
+): Promise<SorteoRankingServerResult> {
+  const pool = getChatPostgresPool();
+  if (!pool) {
+    return { data: [], error: "Falta SUPABASE_DB_URL / DIRECT_URL para leer el ranking." };
+  }
+  const sch = assertAllowedChatDataSchema(dataSchema);
+  const tEnt = quoteSchemaTable(sch, "sorteo_entradas");
+
+  const conds: string[] = [
+    "empresa_id = $1::uuid",
+    "estado_pago = ANY($2::text[])",
+    "COALESCE(TRIM(whatsapp_numero), '') <> ''",
+  ];
+  const params: unknown[] = [empresaId, RANKING_ESTADOS];
+  let i = 3;
+  if (sorteoId) {
+    conds.push(`sorteo_id = $${i}::uuid`);
+    params.push(sorteoId);
+    i++;
+  }
+  if (q && q.trim()) {
+    const term = `%${q.trim().replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+    conds.push(
+      `(nombre_participante ILIKE $${i} ESCAPE '\\'
+        OR COALESCE(documento::text, '') ILIKE $${i} ESCAPE '\\'
+        OR whatsapp_numero ILIKE $${i} ESCAPE '\\')`
+    );
+    params.push(term);
+    i++;
+  }
+  const limIdx = i;
+  params.push(limit);
+
+  const sql = `
+    SELECT
+      whatsapp_numero,
+      (array_agg(nombre_participante ORDER BY created_at DESC))[1] AS nombre_participante,
+      (array_agg(NULLIF(TRIM(documento), '') ORDER BY created_at DESC)
+         FILTER (WHERE NULLIF(TRIM(documento), '') IS NOT NULL))[1] AS documento,
+      COUNT(*)::int AS compras,
+      COALESCE(SUM(cantidad_boletos), 0)::int AS total_boletos,
+      COALESCE(SUM(monto_total), 0)::numeric AS total_monto,
+      MAX(created_at) AS ultima_compra
+    FROM ${tEnt}
+    WHERE ${conds.join(" AND ")}
+    GROUP BY whatsapp_numero
+    ORDER BY total_monto DESC, total_boletos DESC, compras DESC
+    LIMIT $${limIdx}::int
+  `;
+  const res = await pool.query(sql, params);
+  const data: SorteoCompradorRankingRow[] = (res.rows ?? []).map((raw) => {
+    const r = raw as Record<string, unknown>;
+    const ua = r.ultima_compra;
+    return {
+      whatsapp_numero: String(r.whatsapp_numero ?? ""),
+      nombre_participante: String(r.nombre_participante ?? "").trim(),
+      documento:
+        typeof r.documento === "string" && r.documento.trim() ? r.documento.trim() : null,
+      compras: Number(r.compras ?? 0) || 0,
+      total_boletos: Number(r.total_boletos ?? 0) || 0,
+      total_monto: Number(r.total_monto ?? 0) || 0,
+      ultima_compra: ua instanceof Date ? ua.toISOString() : ua != null ? String(ua) : null,
+    };
+  });
+  return { data, error: null };
+}
+
+async function fetchRankingPostgrest(
+  empresaId: string,
+  sorteoId: string | null,
+  limit: number,
+  q: string | null
+): Promise<SorteoRankingServerResult> {
+  const sb = await getChatServiceClientForEmpresa(empresaId);
+  let qb = sb
+    .from("sorteo_entradas")
+    .select("whatsapp_numero, nombre_participante, documento, cantidad_boletos, monto_total, created_at")
+    .eq("empresa_id", empresaId)
+    .in("estado_pago", RANKING_ESTADOS);
+  if (sorteoId) qb = qb.eq("sorteo_id", sorteoId);
+  if (q && q.trim()) {
+    const t = `%${q.trim()}%`;
+    qb = qb.or(`nombre_participante.ilike.${t},documento.ilike.${t},whatsapp_numero.ilike.${t}`);
+  }
+  const { data, error } = await qb
+    .order("created_at", { ascending: false })
+    .range(0, RANKING_POSTGREST_SCAN_CAP - 1);
+  if (error) return { data: [], error: error.message };
+
+  const rows = (data ?? []) as Record<string, unknown>[];
+  const truncated = rows.length >= RANKING_POSTGREST_SCAN_CAP;
+  const byPhone = new Map<string, SorteoCompradorRankingRow>();
+  for (const r of rows) {
+    const phone = String(r.whatsapp_numero ?? "").trim();
+    if (!phone) continue;
+    const mt = Number(r.monto_total ?? 0) || 0;
+    const bol = Number(r.cantidad_boletos ?? 0) || 0;
+    const createdAt = r.created_at != null ? String(r.created_at) : null;
+    const existing = byPhone.get(phone);
+    if (!existing) {
+      // rows vienen ordenadas por created_at desc → la primera es la más reciente (nombre/doc).
+      byPhone.set(phone, {
+        whatsapp_numero: phone,
+        nombre_participante: String(r.nombre_participante ?? "").trim(),
+        documento:
+          typeof r.documento === "string" && r.documento.trim() ? r.documento.trim() : null,
+        compras: 1,
+        total_boletos: bol,
+        total_monto: mt,
+        ultima_compra: createdAt,
+      });
+    } else {
+      existing.compras += 1;
+      existing.total_boletos += bol;
+      existing.total_monto += mt;
+      if (!existing.documento && typeof r.documento === "string" && r.documento.trim()) {
+        existing.documento = r.documento.trim();
+      }
+    }
+  }
+  const sorted = [...byPhone.values()]
+    .sort(
+      (a, b) =>
+        b.total_monto - a.total_monto ||
+        b.total_boletos - a.total_boletos ||
+        b.compras - a.compras
+    )
+    .slice(0, limit);
+  return { data: sorted, error: null, truncated };
+}
+
+/**
+ * Ranking de compradores: agrupa `sorteo_entradas` por número de WhatsApp y acumula
+ * compras, boletas y monto. Prefiere PG directo (agregación en la base) cuando hay pool;
+ * si no, cae a PostgREST agregando en memoria (con tope). Solo lectura.
+ */
+export async function fetchSorteoCompradoresRankingServer(
+  params?: SorteoRankingParams
+): Promise<SorteoRankingServerResult> {
+  const empresaId = await getEmpresaIdForCurrentUserServer();
+  if (!empresaId) return { data: [], error: "Sin sesión o empresa." };
+
+  const dataSchema = await fetchDataSchemaForEmpresaId(empresaId);
+  const sorteoId = params?.sorteoId?.trim() || null;
+  const limit = normalizeRankingLimit(params?.limit);
+  const q = params?.q?.trim() || null;
+
+  try {
+    // Para una agregación GROUP BY conviene siempre la base: si hay pool, PG directo.
+    if (getChatPostgresPool()) {
+      return await fetchRankingPgDirect(empresaId, dataSchema, sorteoId, limit, q);
+    }
+    return await fetchRankingPostgrest(empresaId, sorteoId, limit, q);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const transient = isPgPoolExhaustionMessage(msg);
+    console.error("[sorteos][ranking]", "error", {
+      empresa_id: empresaId,
+      schema: dataSchema,
+      error: msg.slice(0, 400),
+    });
+    return {
+      data: [],
+      error: transient ? "Servidor de base de datos saturado; reintentá en unos segundos." : msg,
+      transient_error: transient,
+    };
+  }
+}
+
+/**
+ * Compras de un comprador (por número de WhatsApp) con su comprobante, para auditar.
+ * Devuelve TODAS las compras (incluye anuladas/rechazadas) para control. Solo lectura.
+ */
+export async function fetchSorteoComprasByWhatsappServer(
+  whatsappNumero: string,
+  sorteoId?: string | null
+): Promise<SorteoCompradorComprasServerResult> {
+  const phone = (whatsappNumero ?? "").trim();
+  if (!phone) return { data: [], error: "Falta el número de WhatsApp." };
+
+  const empresaId = await getEmpresaIdForCurrentUserServer();
+  if (!empresaId) return { data: [], error: "Sin sesión o empresa." };
+
+  const dataSchema = await fetchDataSchemaForEmpresaId(empresaId);
+  const sid = sorteoId?.trim() || null;
+
+  const mapRow = (raw: Record<string, unknown>, nombreById: Record<string, string>): SorteoCompradorCompraRow => {
+    const r = normalizeRowTimestamps(raw);
+    const sidRow = r.sorteo_id != null ? String(r.sorteo_id) : "";
+    return {
+      entrada_id: String(r.id ?? ""),
+      numero_orden: typeof r.numero_orden === "number" ? r.numero_orden : r.numero_orden != null ? Number(r.numero_orden) || null : null,
+      sorteo_nombre: (sidRow && nombreById[sidRow]) || "—",
+      cantidad_boletos: Number(r.cantidad_boletos ?? 0) || 0,
+      monto_total: Number(r.monto_total ?? 0) || 0,
+      estado_pago: r.estado_pago as SorteoEntradaEstadoPago,
+      comprobante_url:
+        typeof r.comprobante_url === "string" && r.comprobante_url.trim()
+          ? r.comprobante_url.trim()
+          : null,
+      created_at: String(r.created_at ?? ""),
+    };
+  };
+
+  try {
+    if (getChatPostgresPool()) {
+      const pool = getChatPostgresPool()!;
+      const sch = assertAllowedChatDataSchema(dataSchema);
+      const tEnt = quoteSchemaTable(sch, "sorteo_entradas");
+      const tSort = quoteSchemaTable(sch, "sorteos");
+      const conds = ["empresa_id = $1::uuid", "whatsapp_numero = $2::text"];
+      const args: unknown[] = [empresaId, phone];
+      if (sid) {
+        conds.push("sorteo_id = $3::uuid");
+        args.push(sid);
+      }
+      const res = await pool.query(
+        `SELECT id, sorteo_id, numero_orden, cantidad_boletos, monto_total, estado_pago, comprobante_url, created_at
+           FROM ${tEnt}
+          WHERE ${conds.join(" AND ")}
+          ORDER BY created_at DESC
+          LIMIT 300`,
+        args
+      );
+      const rows = (res.rows ?? []) as Record<string, unknown>[];
+      const sorteoIds = [...new Set(rows.map((r) => r.sorteo_id).filter(Boolean).map(String))];
+      const nombreById: Record<string, string> = {};
+      if (sorteoIds.length > 0) {
+        const sortRes = await pool.query(
+          `SELECT id, nombre FROM ${tSort} WHERE empresa_id = $1::uuid AND id = ANY($2::uuid[])`,
+          [empresaId, sorteoIds]
+        );
+        for (const s of sortRes.rows as { id: string; nombre: string }[]) nombreById[String(s.id)] = s.nombre;
+      }
+      return { data: rows.map((r) => mapRow(r, nombreById)), error: null };
+    }
+
+    const sb = await getChatServiceClientForEmpresa(empresaId);
+    let qb = sb
+      .from("sorteo_entradas")
+      .select("id, sorteo_id, numero_orden, cantidad_boletos, monto_total, estado_pago, comprobante_url, created_at")
+      .eq("empresa_id", empresaId)
+      .eq("whatsapp_numero", phone);
+    if (sid) qb = qb.eq("sorteo_id", sid);
+    const { data, error } = await qb.order("created_at", { ascending: false }).range(0, 299);
+    if (error) return { data: [], error: error.message };
+    const rows = (data ?? []) as Record<string, unknown>[];
+    const sorteoIds = [...new Set(rows.map((r) => r.sorteo_id).filter(Boolean).map(String))];
+    const nombreById: Record<string, string> = {};
+    if (sorteoIds.length > 0) {
+      const { data: sos } = await sb.from("sorteos").select("id, nombre").eq("empresa_id", empresaId).in("id", sorteoIds);
+      for (const s of (sos ?? []) as { id: string; nombre: string }[]) nombreById[s.id] = s.nombre;
+    }
+    return { data: rows.map((r) => mapRow(r, nombreById)), error: null };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const transient = isPgPoolExhaustionMessage(msg);
+    console.error("[sorteos][ranking-compras]", "error", {
+      empresa_id: empresaId,
+      schema: dataSchema,
+      error: msg.slice(0, 400),
+    });
+    return {
+      data: [],
+      error: transient ? "Servidor de base de datos saturado; reintentá en unos segundos." : msg,
+      transient_error: transient,
+    };
   }
 }
 

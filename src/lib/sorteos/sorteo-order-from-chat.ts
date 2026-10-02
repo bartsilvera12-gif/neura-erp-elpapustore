@@ -1,4 +1,5 @@
 import { fetchDataSchemaForEmpresaId, createServiceRoleClientWithDbSchema } from "@/lib/supabase/empresa-data-schema";
+import { isParticipanteBloqueado } from "@/lib/sorteos/participante-bloqueo";
 import { SUPABASE_APP_SCHEMA, type AppSupabaseClient } from "@/lib/supabase/schema";
 import {
   ensureSorteoOrderViaDirectPostgres,
@@ -1010,6 +1011,32 @@ export async function ensureSorteoOrderFromChat(
     flowDataKeysPrepared: Object.keys(flowData),
     chat_flow_data: flowData,
   });
+
+  // Candado de bloqueo: un participante bloqueado no puede comprar por ninguna vía.
+  // Falla abierto si la tabla no existe (migración sin aplicar); ver participante-bloqueo.ts.
+  {
+    const dataSchemaBloqueo = await fetchDataSchemaForEmpresaId(input.empresaId);
+    if (await isParticipanteBloqueado(input.empresaId, dataSchemaBloqueo, input.whatsappNumero)) {
+      flowTrace("sorteo_order_skipped", {
+        conversation_id: input.conversationId,
+        empresa_id: input.empresaId,
+        flow_code: flowCode,
+        flow_session_id_context: input.flowSessionId?.trim() ?? null,
+        reason: "participante_bloqueado",
+      });
+      console.warn(FLOW_SORTEO_LOG, "ensureSorteoOrderFromChat_outcome", {
+        path: "blocked",
+        reason: "participante_bloqueado",
+        conversationId: input.conversationId,
+        flowCode,
+        whatsapp: input.whatsappNumero,
+      });
+      return {
+        ok: false,
+        message: "Este participante está bloqueado y no puede realizar compras.",
+      };
+    }
+  }
 
   const sorteoId = await getSorteoIdForChatFlow(supabase, input.empresaId, flowCode);
   if (!sorteoId) {

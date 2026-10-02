@@ -145,6 +145,38 @@ export interface SorteoCupon {
   sorteo_entradas?: { nombre_participante: string } | null;
 }
 
+/**
+ * Fila del Ranking de compradores: una persona (agrupada por número de WhatsApp) con sus
+ * totales acumulados. Solo cuenta compras `confirmado` + `pendiente_revision`
+ * (se excluyen `anulado` y `rechazado`, que no son ventas reales).
+ */
+export type SorteoCompradorRankingRow = {
+  whatsapp_numero: string;
+  /** Último nombre declarado por esa persona (puede variar entre compras). */
+  nombre_participante: string;
+  documento: string | null;
+  /** Cantidad de órdenes/compras. */
+  compras: number;
+  /** Total de boletas sumando todas sus compras. */
+  total_boletos: number;
+  /** Monto total gastado (Gs). */
+  total_monto: number;
+  /** Fecha de la última compra (ISO). */
+  ultima_compra: string | null;
+};
+
+/** Detalle de una compra puntual de un comprador (para abrir el comprobante). */
+export type SorteoCompradorCompraRow = {
+  entrada_id: string;
+  numero_orden: number | null;
+  sorteo_nombre: string;
+  cantidad_boletos: number;
+  monto_total: number;
+  estado_pago: SorteoEntradaEstadoPago;
+  comprobante_url: string | null;
+  created_at: string;
+};
+
 /** Body esperado por POST /api/raffles/entries/create (n8n) */
 export interface CreateRaffleEntryPayload {
   empresa_id: string;
