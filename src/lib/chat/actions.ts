@@ -378,7 +378,12 @@ async function logBotTabClassificationSamplePostgrest(
   }
 }
 
-const CONTACT_SEARCH_ID_LIMIT = 500;
+/**
+ * Tope de contactos que entran al `.in("contact_id", ...)` de la lista. Con 500 la URL llegaba a
+ * ~20 KB y la API la rechazaba (414): una búsqueda corta ("098") dejaba la lista vacía. 120 uuids
+ * son ~5 KB y entran con el resto de los filtros. NO subir sin medir (tope real ~8 KB).
+ */
+const CONTACT_SEARCH_ID_LIMIT = 120;
 
 /**
  * Resuelve los `contact_id` cuyo teléfono o nombre matchean la búsqueda (path PostgREST).
@@ -430,7 +435,7 @@ async function resolveContactIdsForSearchPostgrest(
     }
   }
 
-  return [...ids];
+  return [...ids].slice(0, CONTACT_SEARCH_ID_LIMIT);
 }
 
 async function fetchChatConversationsUnsafe(
