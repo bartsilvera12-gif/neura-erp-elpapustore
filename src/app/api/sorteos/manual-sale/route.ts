@@ -16,6 +16,7 @@ import {
 } from "@/lib/sorteos/sorteo-ticket-admin";
 import { maybeGenerateAndSendSorteoTicketDelivery } from "@/lib/sorteos/sorteo-ticket-delivery";
 import { requireAnyModuleSlug } from "@/lib/middleware/module-guard";
+import { isParticipanteBloqueado } from "@/lib/sorteos/participante-bloqueo";
 
 function isUuid(s: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s.trim());
@@ -103,6 +104,14 @@ export async function POST(request: NextRequest) {
 
     const empresaId = ctx.auth.empresa_id;
     const schema = await fetchDataSchemaForEmpresaId(empresaId);
+
+    // Candado de bloqueo: un participante bloqueado no puede comprar por ninguna vía.
+    if (await isParticipanteBloqueado(empresaId, schema, telefono)) {
+      return NextResponse.json(
+        errorResponse("Este participante está bloqueado y no puede realizar compras."),
+        { status: 403 }
+      );
+    }
 
     const created = await createSorteoManualCashSaleViaDirectPostgres({
       schema,

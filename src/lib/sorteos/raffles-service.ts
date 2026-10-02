@@ -1,6 +1,8 @@
 import type { AppSupabaseClient } from "@/lib/supabase/schema";
 import { createServiceRoleClient } from "@/lib/supabase/service-admin";
 import { createServiceRoleClientForEmpresa } from "@/lib/supabase/empresa-data-schema";
+import { fetchDataSchemaForEmpresaId } from "@/lib/supabase/empresa-data-schema";
+import { isParticipanteBloqueado } from "@/lib/sorteos/participante-bloqueo";
 import type {
   CreateRaffleEntryPayload,
   CreateRaffleEntryResponse,
@@ -63,6 +65,15 @@ export async function registrarCompraSorteoN8n(
     return {
       ok: false,
       message: "La empresa no tiene el módulo Sorteos habilitado",
+    };
+  }
+
+  // Candado de bloqueo: un participante bloqueado no puede comprar por ninguna vía.
+  const dataSchema = await fetchDataSchemaForEmpresaId(payload.empresa_id);
+  if (await isParticipanteBloqueado(payload.empresa_id, dataSchema, payload.whatsapp_numero)) {
+    return {
+      ok: false,
+      message: "Este participante está bloqueado y no puede realizar compras.",
     };
   }
 
