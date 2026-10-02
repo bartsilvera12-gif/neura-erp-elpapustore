@@ -122,19 +122,33 @@ export async function listProspectosForEmpresa(
   const prospectos = prospectosData as ProspectoRow[];
   if (prospectos.length === 0) return [];
 
+  // Notas en lotes de ids, de a 6 en paralelo: con todos los prospectos en un solo `.in(...)` la
+  // URL llegaba a 39 KB y el gateway la rechazaba (414), así que el CRM salía sin notas.
   const ids = prospectos.map((p) => p.id);
-  const { data: notasData, error: errN } = await supabase
-    .from("crm_notas")
-    .select("*")
-    .eq("empresa_id", empresaId)
-    .in("prospecto_id", ids)
-    .order("fecha", { ascending: false });
-
-  if (errN) {
-    console.error("[crm] listProspectosForEmpresa (notas):", errN.message);
+  const NOTAS_CHUNK = 100;
+  const NOTAS_EN_PARALELO = 6;
+  const idChunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += NOTAS_CHUNK) idChunks.push(ids.slice(i, i + NOTAS_CHUNK));
+  const notasRows: NotaRow[] = [];
+  for (let i = 0; i < idChunks.length; i += NOTAS_EN_PARALELO) {
+    const notasResults = await Promise.all(
+      idChunks.slice(i, i + NOTAS_EN_PARALELO).map((slice) =>
+        supabase
+          .from("crm_notas")
+          .select("*")
+          .eq("empresa_id", empresaId)
+          .in("prospecto_id", slice)
+          .order("fecha", { ascending: false })
+      )
+    );
+    for (const { data: notasData, error: errN } of notasResults) {
+      if (errN) {
+        console.error("[crm] listProspectosForEmpresa (notas):", errN.message);
+        continue;
+      }
+      notasRows.push(...((notasData as NotaRow[]) ?? []));
+    }
   }
-
-  const notasRows = (notasData as NotaRow[]) ?? [];
   const notasPorProspecto = notasRows.reduce<Record<string, Nota[]>>((acc, n) => {
     if (!acc[n.prospecto_id]) acc[n.prospecto_id] = [];
     acc[n.prospecto_id].unshift(rowToNota(n));
