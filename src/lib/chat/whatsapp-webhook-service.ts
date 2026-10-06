@@ -2124,7 +2124,14 @@ export async function processInboundWebhookValue(
 
         if (!interactiveInboundMetaId) {
           if (message_type === "text") {
-            const skipAfterRestartKeyword = restartKeywordMatch && restartedThisMessage;
+            /**
+             * Si este mismo mensaje ya disparó un reinicio del flujo —por palabra clave O por
+             * intención de compra (p. ej. "hola")— el flujo ya se presentó desde el inicio
+             * (bienvenida + combos). Reprocesar el texto re-presenta el nodo actual y duplica el
+             * envío (combos dobles). Antes el guard sólo cubría el reinicio por palabra clave;
+             * el reinicio por purchase_intent se colaba y por eso los combos salían dos veces.
+             */
+            const skipAfterRestart = restartedThisMessage;
             /**
              * Si el nodo actual se ACABA de presentar con este mismo mensaje, el cliente escribió
              * este texto antes de ver la pregunta: no puede ser su respuesta. Antes esto sólo se
@@ -2182,7 +2189,7 @@ export async function processInboundWebhookValue(
                 nodeCode: resent.nodeCode ?? null,
                 error: resent.error ?? null,
               });
-            } else if (skipAfterRestartKeyword) {
+            } else if (skipAfterRestart) {
               console.info(logW, "skip_text_flow_handler", {
                 conversationId,
                 reason: "mensaje_usado_como_reinicio_flujo_no_es_captura",
