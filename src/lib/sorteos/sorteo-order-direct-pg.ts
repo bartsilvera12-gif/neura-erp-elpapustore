@@ -41,6 +41,12 @@ export type DirectPgSorteoInput = {
   revendedorId: string | null;
   codigoReferidoSnapshot: string | null;
   comprobanteValidacionId: string | null;
+  /**
+   * Estado de pago con el que se crea la entrada. Por defecto `pendiente_revision`
+   * (confirmación manual). El llamador pasa `confirmado` cuando el comprobante ya
+   * quedó validado (`valido` / `aprobado_manual`) para auto-confirmar la venta.
+   */
+  estadoPago?: string | null;
 };
 
 export type DirectPgSorteoOk = {
@@ -340,6 +346,10 @@ export async function ensureSorteoOrderViaDirectPostgres(
     const numeroOrden = Number(s.ultimo_numero_orden) + 1;
     const ultCupon = Number(s.ultimo_numero_cupon);
 
+    // Auto-confirmación: si el comprobante ya está validado, la venta nace "confirmado".
+    // Cualquier otro valor cae al comportamiento seguro de siempre ("pendiente_revision").
+    const estadoPagoIns = input.estadoPago === "confirmado" ? "confirmado" : "pendiente_revision";
+
     const rowEnt: Record<string, unknown> = {
       empresa_id: input.empresaId,
       sorteo_id: input.sorteoId,
@@ -352,7 +362,7 @@ export async function ensureSorteoOrderViaDirectPostgres(
       cantidad_boletos: qty,
       monto_total: montoTotal,
       moneda: "PYG",
-      estado_pago: "pendiente_revision",
+      estado_pago: estadoPagoIns,
       comprobante_url: input.comprobanteUrl.trim() || null,
       validado_por: input.validadoPor.trim() || "chat_flow",
       numero_orden: numeroOrden,
@@ -366,6 +376,10 @@ export async function ensureSorteoOrderViaDirectPostgres(
 
     if (entCols.has("comprobante_validacion_id") && input.comprobanteValidacionId?.trim()) {
       rowEnt.comprobante_validacion_id = input.comprobanteValidacionId.trim();
+    }
+    // Si la venta nace confirmada, dejamos registrado el momento de la confirmación.
+    if (estadoPagoIns === "confirmado" && entCols.has("validado_at")) {
+      rowEnt.validado_at = new Date().toISOString();
     }
     if (entCols.has("revendedor_id") && input.revendedorId?.trim()) {
       rowEnt.revendedor_id = input.revendedorId.trim();
@@ -445,7 +459,7 @@ export async function ensureSorteoOrderViaDirectPostgres(
       montoTotal,
       promoNombre: input.promoNombre.trim(),
       precioFuente: precioFuenteIns,
-      estadoPago: "pendiente_revision",
+      estadoPago: estadoPagoIns,
     };
   } catch (err: unknown) {
     await client.query("ROLLBACK").catch(() => {});

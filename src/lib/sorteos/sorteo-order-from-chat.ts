@@ -1159,6 +1159,15 @@ export async function ensureSorteoOrderFromChat(
   const dataSchema = await fetchDataSchemaForEmpresaId(input.empresaId);
   const hasDirectPg = Boolean(getChatPostgresConnectionString());
 
+  // Auto-confirmación: si el comprobante ya quedó validado (válido o aprobado por un asesor),
+  // la venta se crea directamente como "confirmado". Sin estado explícito de validación se
+  // mantiene "pendiente_revision" (confirmación manual), que es el comportamiento seguro previo.
+  const comprobanteEstadoValidacion = norm(flowData[SORTEO_COMPROBANTE_ESTADO_VALIDACION_FIELD]);
+  const estadoPagoInicial =
+    comprobanteEstadoValidacion === "valido" || comprobanteEstadoValidacion === "aprobado_manual"
+      ? "confirmado"
+      : "pendiente_revision";
+
   const directOrderArgs = {
     schema: dataSchema,
     empresaId: input.empresaId,
@@ -1180,6 +1189,7 @@ export async function ensureSorteoOrderFromChat(
     revendedorId,
     codigoReferidoSnapshot: codigoReferidoSnap,
     comprobanteValidacionId: norm(flowData[SORTEO_COMPROBANTE_VALIDACION_ID_FIELD]) || null,
+    estadoPago: estadoPagoInicial,
   };
 
   const msgFallback =
