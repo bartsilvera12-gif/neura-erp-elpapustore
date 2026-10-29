@@ -224,12 +224,40 @@ async function selectCandidates(
     ? `AND NOT EXISTS (SELECT 1 FROM ${entradas} se WHERE se.chat_conversation_id = c.id AND se.estado_pago = 'confirmado')`
     : "";
 
+  // Candidatos primero (decenas de filas), después el último entrante SOLO de esos.
+  // Antes `last_in` hacía DISTINCT ON sobre los ~2M mensajes ANTES de cruzar con las
+  // conversaciones: escaneo completo de chat_messages en cada corrida (~55 s, quema un núcleo).
+  // Ahora se filtra la banda de conversaciones elegibles y para cada una se busca su último
+  // mensaje 'contact' con un LATERAL ... LIMIT 1 que usa el índice (conversation_id, created_at).
+  // Mismos resultados y mismo orden; sólo cambia cómo se calcula.
   const sql = `
-    WITH last_in AS (
-      SELECT DISTINCT ON (m.conversation_id) m.conversation_id, m.created_at
-      FROM ${msgs} m
-      WHERE m.sender_type = 'contact'
-      ORDER BY m.conversation_id, m.created_at DESC
+    WITH cand AS (
+      SELECT c.id,
+             c.flow_current_node,
+             c.active_flow_session_id
+      FROM ${convs} c
+      WHERE c.empresa_id = $1
+        AND c.flow_code = $3
+        AND c.flow_status = 'bot'
+        AND c.human_taken_over = false
+        AND c.status <> 'closed'
+        AND c.active_flow_session_id IS NOT NULL
+        AND c.flow_current_node IS NOT NULL
+        AND NOT (c.flow_current_node = ANY($4::text[]))
+        ${includedClause}
+        ${purchaseClause}
+    ),
+    li AS (
+      SELECT cand.id AS conversation_id, m.created_at
+      FROM cand
+      CROSS JOIN LATERAL (
+        SELECT mm.created_at
+        FROM ${msgs} mm
+        WHERE mm.conversation_id = cand.id
+          AND mm.sender_type = 'contact'
+        ORDER BY mm.created_at DESC
+        LIMIT 1
+      ) m
     ),
     rl AS (
       SELECT conversation_id,
@@ -243,23 +271,13 @@ async function selectCandidates(
            c.flow_current_node,
            c.active_flow_session_id::text AS active_flow_session_id,
            floor(extract(epoch FROM (now() - li.created_at)) / 60)::int AS idle_min
-    FROM ${convs} c
-    JOIN last_in li ON li.conversation_id = c.id
+    FROM cand c
+    JOIN li ON li.conversation_id = c.id
     LEFT JOIN rl ON rl.conversation_id = c.id
-    WHERE c.empresa_id = $1
-      AND c.flow_code = $3
-      AND c.flow_status = 'bot'
-      AND c.human_taken_over = false
-      AND c.status <> 'closed'
-      AND c.active_flow_session_id IS NOT NULL
-      AND c.flow_current_node IS NOT NULL
-      AND NOT (c.flow_current_node = ANY($4::text[]))
-      ${includedClause}
-      AND li.created_at <= now() - ($5 || ' seconds')::interval
+    WHERE li.created_at <= now() - ($5 || ' seconds')::interval
       AND li.created_at >= now() - ($6 || ' minutes')::interval
       AND coalesce(rl.sent_count, 0) < $7
       AND (rl.last_sent IS NULL OR rl.last_sent <= now() - ($8 || ' seconds')::interval)
-      ${purchaseClause}
     ORDER BY li.created_at DESC
     LIMIT $9`;
 
