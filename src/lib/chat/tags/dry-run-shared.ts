@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 import { assertAllowedChatDataSchema } from "@/lib/supabase/chat-data-schema";
+import { schemaHasBulkCategoryFn } from "./has-bulk-category-fn";
 
 /**
  * Etiquetas Automáticas - FASE 2 (dry-run).
@@ -240,6 +241,11 @@ type DecisionCode =
 
 export async function runTagDryRun(pool: Pool, input: TagDryRunInput): Promise<TagDryRunResult> {
   const sch = assertAllowedChatDataSchema(input.schema);
+  // Optimización: si el schema tiene el clasificador set-based, se calcula la
+  // categoría de todas las conversaciones en una pasada (JOIN) en vez de llamar
+  // la función fila-por-fila (que con decenas de miles de candidatas tardaba
+  // ~165 s y saturaba la base). Fallback transparente a la función original.
+  const useBulk = await schemaHasBulkCategoryFn(pool, sch);
   const days = Math.max(1, Math.floor(input.daysWithoutActivity || TAG_DRY_RUN_DEFAULT_DAYS));
   const limit = Math.min(
     TAG_DRY_RUN_MAX_LIMIT,
@@ -283,8 +289,19 @@ export async function runTagDryRun(pool: Pool, input: TagDryRunInput): Promise<T
     ? `WHEN b.active_flow_session_id IS NOT NULL THEN 'excluded_active_bot_strict'`
     : "";
 
+  // Clasificador: bulk set-based (JOIN) cuando el schema lo tiene; si no, la
+  // función fila-por-fila original. $1 = empresa_id (mismo del WHERE de base).
+  const bulkCte = useBulk
+    ? `cats_src AS (
+        SELECT conversation_id, category
+          FROM "${sch}".chat_tag_purchase_category_bulk($1)
+      ),`
+    : "";
+  const bulkJoin = useBulk ? `LEFT JOIN cats_src ON cats_src.conversation_id = c.id` : "";
+  const categoryExpr = useBulk ? "cats_src.category" : `"${sch}".chat_tag_purchase_category(c.id)`;
+
   const sql = `
-    WITH base AS (
+    WITH ${bulkCte} base AS (
       SELECT
         c.id,
         c.contact_id,
@@ -296,9 +313,10 @@ export async function runTagDryRun(pool: Pool, input: TagDryRunInput): Promise<T
         c.flow_current_node,
         ct.phone_number,
         EXTRACT(EPOCH FROM (now() - c.last_message_at)) / 86400.0 AS days_idle,
-        "${sch}".chat_tag_purchase_category(c.id) AS category
+        ${categoryExpr} AS category
       FROM "${sch}".chat_conversations c
       LEFT JOIN "${sch}".chat_contacts ct ON ct.id = c.contact_id
+      ${bulkJoin}
       WHERE c.empresa_id = $1
         AND c.status IN ('open','pending')
         AND c.hidden_by_tag = false
