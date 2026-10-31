@@ -982,6 +982,76 @@ export function buildSorteoOrderFlowVarOverrides(
 }
 
 /**
+ * Un revendedor existe por (código, sorteo): cada sorteo tiene su PROPIA fila aunque el código sea
+ * el mismo (ej. `RevLuci` tiene una fila por sorteo). La sesión/conversación de chat puede sobrevivir
+ * a un sorteo (misma conversación, mismo flow_code, pero `chat_flows.sorteo_id` ya apunta al sorteo
+ * vigente), así que `chat_flow_sessions.revendedor_id` puede apuntar a la fila de un SORTEO ANTERIOR.
+ * Si se estampa tal cual en una entrada del sorteo vigente, esa venta se acredita al revendedor del
+ * sorteo viejo y el panel del sorteo actual la muestra de menos (bug recurrente en cada cambio de
+ * sorteo). Acá revalidamos: si el revendedor de la sesión no es de este sorteo, lo re-resolvemos por
+ * código dentro del sorteo vigente; si no hay match, descartamos la atribución antes que cross-acreditar.
+ */
+async function resolveRevendedorForSorteo(
+  dbTenant: AppSupabaseClient,
+  empresaId: string,
+  sorteoId: string,
+  sessionRevendedorId: string | null | undefined,
+  codigoSnapshot: string | null | undefined
+): Promise<{ revendedorId: string | null; codigo: string | null }> {
+  const rid = sessionRevendedorId?.trim() || "";
+  const snap = codigoSnapshot?.trim() || "";
+  if (!rid) return { revendedorId: null, codigo: snap || null };
+
+  const { data: revRow } = await dbTenant
+    .from("sorteo_revendedores")
+    .select("id, codigo_referido, sorteo_id, activo")
+    .eq("id", rid)
+    .eq("empresa_id", empresaId)
+    .maybeSingle();
+  const r = revRow as
+    | { id: string; codigo_referido: string | null; sorteo_id: string | null; activo: boolean | null }
+    | null;
+
+  // Caso correcto: el revendedor de la sesión ya pertenece a este sorteo.
+  if (r && r.sorteo_id === sorteoId) {
+    return { revendedorId: r.id, codigo: snap || (r.codigo_referido ?? null) };
+  }
+
+  // Mismatch (fila de otro sorteo) o fila inexistente: re-resolver por código en el sorteo vigente.
+  const codigo = (snap || (r?.codigo_referido ?? "")).trim();
+  if (codigo) {
+    const { data: fixRows } = await dbTenant
+      .from("sorteo_revendedores")
+      .select("id, codigo_referido")
+      .eq("empresa_id", empresaId)
+      .eq("sorteo_id", sorteoId)
+      .eq("activo", true)
+      .ilike("codigo_referido", codigo)
+      .limit(1);
+    const fx = Array.isArray(fixRows) ? (fixRows[0] as { id: string; codigo_referido: string | null } | undefined) : undefined;
+    if (fx?.id) {
+      console.info(FLOW_SORTEO_LOG, "revendedor_remapped_to_current_sorteo", {
+        empresa_id: empresaId,
+        sorteo_id: sorteoId,
+        from_revendedor_id: rid,
+        to_revendedor_id: fx.id,
+        codigo,
+      });
+      return { revendedorId: fx.id, codigo: fx.codigo_referido ?? codigo };
+    }
+  }
+
+  // Sin match en el sorteo vigente: no cross-acreditar al revendedor de otro sorteo.
+  console.warn(FLOW_SORTEO_LOG, "revendedor_dropped_no_match_in_current_sorteo", {
+    empresa_id: empresaId,
+    sorteo_id: sorteoId,
+    session_revendedor_id: rid,
+    codigo: codigo || null,
+  });
+  return { revendedorId: null, codigo: codigo || null };
+}
+
+/**
  * Crea orden (sorteo_entradas) + cupones vía RPC atómica e idempotente.
  * Si el flow no tiene sorteo_id o faltan datos, hace skip sin error.
  * No exige `empresa_modulos.sorteos`: el vínculo explícito chat_flows.sorteo_id basta.
@@ -1138,6 +1208,7 @@ export async function ensureSorteoOrderFromChat(
 
   let revendedorId: string | null = null;
   let codigoReferidoSnap: string | null = null;
+  let sessionRevendedorId: string | null = null;
   const sidTrim = input.flowSessionId?.trim() ?? null;
   if (sidTrim) {
     const { data: sRef } = await supabase
@@ -1146,17 +1217,35 @@ export async function ensureSorteoOrderFromChat(
       .eq("id", sidTrim)
       .eq("empresa_id", input.empresaId)
       .maybeSingle();
-    const rid = (sRef as { revendedor_id?: string | null } | null)?.revendedor_id?.trim();
-    const csnap = (sRef as { codigo_referido_snapshot?: string | null } | null)?.codigo_referido_snapshot?.trim();
-    if (rid) {
-      rpcPayload.revendedor_id = rid;
-      rpcPayload.codigo_referido = csnap ?? "";
-      revendedorId = rid;
-      codigoReferidoSnap = csnap ?? null;
-    }
+    sessionRevendedorId =
+      (sRef as { revendedor_id?: string | null } | null)?.revendedor_id?.trim() ?? null;
+    codigoReferidoSnap =
+      (sRef as { codigo_referido_snapshot?: string | null } | null)?.codigo_referido_snapshot?.trim() ?? null;
   }
 
   const dataSchema = await fetchDataSchemaForEmpresaId(input.empresaId);
+
+  // Revalidar el revendedor contra el sorteo de ESTA orden: la sesión puede arrastrar el revendedor
+  // de un sorteo anterior y cross-acreditar la venta (ver resolveRevendedorForSorteo). Usamos el
+  // cliente del schema del tenant para leer `sorteo_revendedores`.
+  if (sessionRevendedorId) {
+    const dbRevendedor =
+      dataSchema === SUPABASE_APP_SCHEMA ? supabase : createServiceRoleClientWithDbSchema(dataSchema);
+    const resolved = await resolveRevendedorForSorteo(
+      dbRevendedor,
+      input.empresaId,
+      sorteoId,
+      sessionRevendedorId,
+      codigoReferidoSnap
+    );
+    revendedorId = resolved.revendedorId;
+    codigoReferidoSnap = resolved.codigo;
+    if (revendedorId) {
+      rpcPayload.revendedor_id = revendedorId;
+      rpcPayload.codigo_referido = codigoReferidoSnap ?? "";
+    }
+  }
+
   const hasDirectPg = Boolean(getChatPostgresConnectionString());
 
   // Auto-confirmación: si el comprobante ya quedó validado (válido o aprobado por un asesor),
