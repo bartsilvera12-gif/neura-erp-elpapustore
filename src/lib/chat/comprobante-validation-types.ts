@@ -64,6 +64,11 @@ export interface ComprobanteValidationSettings {
    */
   validar_datos_bancarios_ocr: boolean;
   datos_bancarios_esperados: DatosBancariosEsperadosConfig;
+  /**
+   * Otras cuentas donde también se cobra (p. ej. BNF + Continental). Un comprobante es válido si
+   * coincide con la principal o con cualquiera de estas. Vacío = comportamiento de siempre.
+   */
+  cuentas_bancarias_adicionales: DatosBancariosEsperadosConfig[];
   /** Mínimo de coincidencias entre pares (titular, cuenta, alias) requeridas; acotado al número de campos esperados no vacíos. */
   min_coincidencias_bancarias: number;
   deteccion_duplicados_hash: boolean;
@@ -169,6 +174,7 @@ export function defaultComprobanteValidationSettings(): ComprobanteValidationSet
     monto_fields_prioridad: ["monto", "monto_compra", "sorteo_monto_opcion"],
     validar_datos_bancarios_ocr: false,
     datos_bancarios_esperados: { titular: "", numero_cuenta: "", alias: "" },
+    cuentas_bancarias_adicionales: [],
     min_coincidencias_bancarias: 1,
     deteccion_duplicados_hash: true,
     ocr_obligatorio: true,
@@ -310,6 +316,19 @@ export function parseComprobanteValidationConfig(config: unknown): ComprobanteVa
     };
   }
 
+  const clipCta = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+  const cuentasAdicionales: DatosBancariosEsperadosConfig[] = Array.isArray(r.cuentas_bancarias_adicionales)
+    ? r.cuentas_bancarias_adicionales
+        .filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object" && !Array.isArray(x))
+        .map((o) => ({
+          titular: clipCta(o.titular, 200),
+          numero_cuenta: clipCta(o.numero_cuenta, 64),
+          alias: clipCta(o.alias, 80),
+        }))
+        .filter((c) => Boolean(c.titular || c.numero_cuenta || c.alias))
+        .slice(0, 10)
+    : [];
+
   const minCoinRaw = r.min_coincidencias_bancarias;
   const minCoin =
     typeof minCoinRaw === "number" && Number.isFinite(minCoinRaw)
@@ -326,6 +345,7 @@ export function parseComprobanteValidationConfig(config: unknown): ComprobanteVa
     monto_fields_prioridad: montoFields,
     validar_datos_bancarios_ocr: r.validar_datos_bancarios_ocr === true,
     datos_bancarios_esperados: datosBancarios,
+    cuentas_bancarias_adicionales: cuentasAdicionales,
     min_coincidencias_bancarias: minCoin,
     deteccion_duplicados_hash: boolOr(r.deteccion_duplicados_hash, base.deteccion_duplicados_hash),
     ocr_obligatorio: boolOr(r.ocr_obligatorio, base.ocr_obligatorio),
@@ -356,6 +376,8 @@ export function comprobanteValidationSettingsForForm(
     monto_fields_prioridad: [...settings.monto_fields_prioridad],
     validar_datos_bancarios_ocr: settings.validar_datos_bancarios_ocr,
     datos_bancarios_esperados: { ...settings.datos_bancarios_esperados },
+    // Se conservan al guardar desde el panel (que no las edita) para no borrarlas sin querer.
+    cuentas_bancarias_adicionales: settings.cuentas_bancarias_adicionales.map((c) => ({ ...c })),
     min_coincidencias_bancarias: settings.min_coincidencias_bancarias,
     deteccion_duplicados_hash: settings.deteccion_duplicados_hash,
     ocr_obligatorio: settings.ocr_obligatorio,

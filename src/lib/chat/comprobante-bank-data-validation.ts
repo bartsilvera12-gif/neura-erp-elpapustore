@@ -226,11 +226,43 @@ const emptyAuditPartial = (): Omit<BankValidationAudit, "bank_val_status"> => ({
   bank_val_min_requeridas: null,
 });
 
+/** Cuenta principal + adicionales del canal (las que reciben pagos hoy). */
+export function cuentasBancariasVigentes(settings: ComprobanteValidationSettings): DatosBancariosEsperadosConfig[] {
+  return [settings.datos_bancarios_esperados, ...(settings.cuentas_bancarias_adicionales ?? [])];
+}
+
+/** Igual que `ocrReferenciaMatchesConfiguredMerchantIdentifiers` pero contra todas las cuentas vigentes. */
+export function ocrReferenciaMatchesAnyConfiguredAccount(
+  refRaw: string | null | undefined,
+  settings: ComprobanteValidationSettings
+): boolean {
+  return cuentasBancariasVigentes(settings).some((d) => ocrReferenciaMatchesConfiguredMerchantIdentifiers(refRaw, d));
+}
+
 /**
  * Compara datos bancarios del OCR con los configurados en el canal (no usa flujo).
+ * Con cuentas adicionales, el comprobante es válido si coincide con cualquiera; si no coincide
+ * con ninguna se informa el resultado contra la cuenta principal (igual que antes).
  */
 export function validateReceiptBankDataAgainstExpected(
   settings: ComprobanteValidationSettings,
+  fullTextOcr: string
+): ValidateReceiptBankDataResult {
+  const principal = validateReceiptBankDataAgainstOneAccount(settings, settings.datos_bancarios_esperados, fullTextOcr);
+  const extras = settings.cuentas_bancarias_adicionales ?? [];
+  if (!settings.validar_datos_bancarios_ocr || extras.length === 0 || (principal.apply && principal.ok)) {
+    return principal;
+  }
+  for (const cuenta of extras) {
+    const r = validateReceiptBankDataAgainstOneAccount(settings, cuenta, fullTextOcr);
+    if (r.apply && r.ok) return r;
+  }
+  return principal;
+}
+
+function validateReceiptBankDataAgainstOneAccount(
+  settings: ComprobanteValidationSettings,
+  exp: DatosBancariosEsperadosConfig,
   fullTextOcr: string
 ): ValidateReceiptBankDataResult {
   const baseAudit = (status: BankValidationAuditStatus): BankValidationAudit => ({
@@ -242,7 +274,6 @@ export function validateReceiptBankDataAgainstExpected(
     return { apply: false, audit: baseAudit("omitido_config") };
   }
 
-  const exp = settings.datos_bancarios_esperados;
   const nExp = countExpectedNonEmpty(exp);
   if (nExp === 0) {
     return { apply: false, audit: baseAudit("omitido_sin_esperado") };

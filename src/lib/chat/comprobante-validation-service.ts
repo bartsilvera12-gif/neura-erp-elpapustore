@@ -34,7 +34,7 @@ import {
   type SelectReceiptMontoFromOcrOptions,
 } from "@/lib/chat/comprobante-ocr-monto-selection";
 import {
-  ocrReferenciaMatchesConfiguredMerchantIdentifiers,
+  ocrReferenciaMatchesAnyConfiguredAccount,
   validateReceiptBankDataAgainstExpected,
 } from "@/lib/chat/comprobante-bank-data-validation";
 import {
@@ -612,7 +612,7 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
 
   const refStored = extracted.referencia.trim().toUpperCase() || null;
   let refForDup = ocrReferenceUsableForStrongDuplicate(refStored);
-  if (refForDup && ocrReferenciaMatchesConfiguredMerchantIdentifiers(refStored, settings.datos_bancarios_esperados)) {
+  if (refForDup && ocrReferenciaMatchesAnyConfiguredAccount(refStored, settings)) {
     console.info("[sorteo-comprobante][ocr-reference-ignored]", {
       reason: "matches_expected_bank_account",
       empresa_id: ctx.empresaId,
