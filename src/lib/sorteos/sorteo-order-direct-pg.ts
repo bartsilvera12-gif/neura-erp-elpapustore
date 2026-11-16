@@ -9,6 +9,7 @@ import "server-only";
 import pg from "pg";
 import { getChatPostgresPool } from "@/lib/supabase/chat-pg-pool";
 import { insertSorteoCuponesAndUpdateSorteoCounters } from "@/lib/sorteos/sorteo-order-cupones-pg";
+import { dentroDeGraciaCierre } from "@/lib/sorteos/sorteo-cierre-ventas";
 
 const FLOW_SORTEO_LOG = "[flow-sorteo]" as const;
 
@@ -209,6 +210,7 @@ export async function ensureSorteoOrderViaDirectPostgres(
       "total_boletos_vendidos",
       "ultimo_numero_cupon",
       "ultimo_numero_orden",
+      "fecha_sorteo",
     ];
     if (sortCols.has("coupon_numbering_enabled")) sortSelectCols.push("coupon_numbering_enabled");
     if (sortCols.has("coupon_number_start")) sortSelectCols.push("coupon_number_start");
@@ -229,6 +231,7 @@ export async function ensureSorteoOrderViaDirectPostgres(
           total_boletos_vendidos: number;
           ultimo_numero_cupon: number;
           ultimo_numero_orden: number;
+          fecha_sorteo?: string | Date | null;
           coupon_numbering_enabled?: boolean;
           coupon_number_start?: number | null;
           coupon_number_mode?: string | null;
@@ -243,7 +246,18 @@ export async function ensureSorteoOrderViaDirectPostgres(
       await client.query("ROLLBACK");
       return { ok: false, message: "El sorteo no pertenece a la empresa indicada." };
     }
-    if (String(s.estado) !== "activo") {
+    /**
+     * Cerrado por fecha: quien ya estaba a mitad de compra puede terminarla dentro del margen
+     * (el bot solo deja llegar hasta acá a quien eligió un combo antes del cierre).
+     */
+    const enGraciaCierre = dentroDeGraciaCierre({
+      id: input.sorteoId,
+      nombre: "",
+      estado: String(s.estado),
+      fecha_sorteo:
+        s.fecha_sorteo == null ? null : s.fecha_sorteo instanceof Date ? s.fecha_sorteo.toISOString() : String(s.fecha_sorteo),
+    });
+    if (String(s.estado) !== "activo" && !enGraciaCierre) {
       await client.query("ROLLBACK");
       return { ok: false, message: "El sorteo no está activo." };
     }

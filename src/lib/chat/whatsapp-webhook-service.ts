@@ -51,6 +51,7 @@ import type {
 } from "@/lib/chat/types";
 import { normalizeWaPhone } from "@/lib/chat/wa-phone";
 import { applySorteoReferralToActiveSession } from "@/lib/sorteos/referral-attribution";
+import { decidirCierreParaInbound, mensajeVentasCerradas } from "@/lib/sorteos/sorteo-cierre-ventas";
 import { markCampaignReplyFromInbound } from "@/lib/campaigns/campaign-inbound-hook";
 import { executeCampaignButtonActionForMatchedRecipient } from "@/lib/campaigns/campaign-button-action-service";
 import {
@@ -2007,7 +2008,77 @@ export async function processInboundWebhookValue(
         ReturnType<typeof flowEngine.ensureCurrentNodePresentedAfterInbound>
       > | null = null;
 
-      if (skipFlowForBusinessAutomation) {
+      /**
+       * Ventas cerradas (llegó la fecha del sorteo del flujo, o el sorteo ya no está activo): el mensaje
+       * no pasa por el flujo y se avisa una vez. Quien ya eligió un combo tiene un margen para terminar.
+       * Falla abierto: si la lectura falla, sigue como antes.
+       */
+      let ventasCerradasSkip = false;
+      {
+        const convState = existingConv as {
+          flow_code?: string | null;
+          active_flow_session_id?: string | null;
+          flow_status?: string | null;
+          human_taken_over?: boolean | null;
+        };
+        const enBot =
+          !convState.human_taken_over &&
+          String(convState.flow_status ?? "bot").trim().toLowerCase() !== "human";
+        if (enBot && !keywordHandoffPendingConfirmation) {
+          try {
+            const cierre = await decidirCierreParaInbound({
+              supabase,
+              empresaId,
+              conversationId,
+              flowCode: convState.flow_code,
+              flowSessionId: convState.active_flow_session_id,
+            });
+            if (cierre.bloquear) {
+              ventasCerradasSkip = true;
+              console.info(logW, "ventas_cerradas_skip_flow", {
+                conversationId,
+                sorteo_id: cierre.sorteo.id,
+                avisar: cierre.avisar,
+              });
+              if (cierre.avisar) {
+                const texto = mensajeVentasCerradas(cierre.sorteo);
+                const ctxV = await resolveOutboundTextContextFromConversationId(supabase, conversationId, empresaId);
+                const sendV = await sendOutboundTextMessage(ctxV, texto);
+                if (sendV.ok) {
+                  const nowV = new Date().toISOString();
+                  await supabase.from("chat_messages").insert({
+                    empresa_id: empresaId,
+                    conversation_id: conversationId,
+                    wa_message_id: sendV.waMessageId,
+                    from_me: true,
+                    sender_type: "system",
+                    message_type: "text",
+                    content: texto,
+                    raw_payload: (sendV.raw ?? {}) as Record<string, unknown>,
+                  });
+                  await supabase
+                    .from("chat_conversations")
+                    .update({
+                      last_message_at: nowV,
+                      last_message_preview: texto.slice(0, 280),
+                      updated_at: nowV,
+                    })
+                    .eq("id", conversationId);
+                }
+              }
+            }
+          } catch (e) {
+            console.warn(logW, "ventas_cerradas_check_failed", {
+              conversationId,
+              err: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      }
+
+      if (ventasCerradasSkip) {
+        // Ya se avisó (o se avisó hace poco): no se presenta ningún nodo del flujo.
+      } else if (skipFlowForBusinessAutomation) {
         console.info(logW, "skip_flow_engine_business_automation", {
           conversationId,
           sentWelcome: businessAutomationResult.sentWelcome,
@@ -2405,6 +2476,8 @@ export async function processInboundWebhookValue(
         let skippedReason: string | null = null;
         if (htImg || fsImg === "human") {
           skippedReason = "human_mode";
+        } else if (ventasCerradasSkip) {
+          skippedReason = "ventas_cerradas";
         }
 
         let fallbackPublicUrl: string | undefined;

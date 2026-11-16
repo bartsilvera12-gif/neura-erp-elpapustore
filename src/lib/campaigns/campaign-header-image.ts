@@ -2,6 +2,19 @@ import "server-only";
 
 /** Nombre canónico de columna en Excel (tras normalizar). */
 export const HEADER_IMAGE_URL_COLUMN_CANONICAL = "header_image_url";
+/**
+ * Alias de columna para la URL de la cabecera. El header de Meta puede ser
+ * imagen o video; la URL se guarda igual, asi que aceptamos cualquiera de estos.
+ */
+export const HEADER_MEDIA_URL_COLUMN_ALIASES = [
+  "header_image_url",
+  "header_video_url",
+  "header_media_url",
+];
+
+function isHeaderMediaColumn(name: string): boolean {
+  return HEADER_MEDIA_URL_COLUMN_ALIASES.includes(normalizeCampaignSheetHeader(name));
+}
 
 export function normalizeCampaignSheetHeader(h: string): string {
   return h.trim().toLowerCase().replace(/\s+/g, "_");
@@ -9,7 +22,7 @@ export function normalizeCampaignSheetHeader(h: string): string {
 
 export function findHeaderImageUrlColumnKey(headers: string[]): string | null {
   for (const h of headers) {
-    if (normalizeCampaignSheetHeader(h) === HEADER_IMAGE_URL_COLUMN_CANONICAL) return h;
+    if (isHeaderMediaColumn(h)) return h;
   }
   return null;
 }
@@ -17,7 +30,7 @@ export function findHeaderImageUrlColumnKey(headers: string[]): string | null {
 /** Lee URL de imagen desde una fila importada (compara encabezados normalizados). */
 export function getHeaderImageUrlFromRow(row: Record<string, string>): string | null {
   for (const [k, v] of Object.entries(row)) {
-    if (normalizeCampaignSheetHeader(k) === HEADER_IMAGE_URL_COLUMN_CANONICAL) {
+    if (isHeaderMediaColumn(k)) {
       const t = String(v ?? "").trim();
       return t.length > 0 ? t : null;
     }
@@ -25,15 +38,29 @@ export function getHeaderImageUrlFromRow(row: Record<string, string>): string | 
   return null;
 }
 
-export function templateSnapshotHasHeaderImage(components: unknown): boolean {
-  if (!Array.isArray(components)) return false;
-  return components.some((c) => {
+/** Formatos de cabecera con media que exigen adjuntar una URL en cada envio. */
+export type HeaderMediaFormat = "IMAGE" | "VIDEO" | "DOCUMENT";
+
+/** Formato de la cabecera con media, o null si la plantilla no tiene una. */
+export function templateSnapshotHeaderMediaFormat(
+  components: unknown
+): HeaderMediaFormat | null {
+  if (!Array.isArray(components)) return null;
+  for (const c of components) {
     const o = c as { type?: string; format?: string };
-    return (
-      String(o.type ?? "").toUpperCase() === "HEADER" &&
-      String(o.format ?? "").toUpperCase() === "IMAGE"
-    );
-  });
+    if (String(o.type ?? "").toUpperCase() !== "HEADER") continue;
+    const fmt = String(o.format ?? "").toUpperCase();
+    if (fmt === "IMAGE" || fmt === "VIDEO" || fmt === "DOCUMENT") return fmt;
+  }
+  return null;
+}
+
+/**
+ * True si la plantilla tiene cabecera con media (imagen, video o documento) que
+ * obliga a mandar una URL en cada envio. (Nombre historico: antes solo imagen.)
+ */
+export function templateSnapshotHasHeaderImage(components: unknown): boolean {
+  return templateSnapshotHeaderMediaFormat(components) !== null;
 }
 
 export function isHttpsUrl(url: string): boolean {
@@ -123,7 +150,7 @@ export function resolveHeaderImageUrlForCampaign(params: {
       ok: false,
       reason: "missing",
       message:
-        "La plantilla incluye imagen de cabecera. Configurá header_image_url en send_config o agregá la columna header_image_url en el Excel (https, una sola URL para la campaña).",
+        "La plantilla incluye una cabecera con media (imagen o video). Configurá la URL en send_config o agregá una columna header_image_url (o header_video_url) en el Excel: https pública, una sola URL para toda la campaña.",
     };
   }
 
@@ -133,7 +160,7 @@ export function resolveHeaderImageUrlForCampaign(params: {
       ok: false,
       reason: "multiple",
       message:
-        "En esta fase la campaña admite una sola imagen. Unificá header_image_url en la campaña y en el Excel.",
+        "En esta fase la campaña admite una sola URL de cabecera. Unificá la URL (header_image_url / header_video_url) en la campaña y en el Excel.",
     };
   }
 
@@ -143,7 +170,7 @@ export function resolveHeaderImageUrlForCampaign(params: {
     return {
       ok: false,
       reason: "invalid",
-      message: "La header_image_url debe ser una URL https válida y accesible públicamente.",
+      message: "La URL de la cabecera debe ser https válida y accesible públicamente.",
     };
   }
 
@@ -192,7 +219,7 @@ export function evaluateHeaderImageOnImport(params: {
       ok: false,
       reason: "missing",
       message:
-        "La plantilla incluye imagen de cabecera. Agregá la columna header_image_url en el Excel con una URL https (la misma en cada fila válida).",
+        "La plantilla incluye una cabecera con media (imagen o video). Agregá la columna header_image_url (o header_video_url) en el Excel con una URL https, la misma en cada fila válida.",
     };
   }
 
@@ -200,7 +227,7 @@ export function evaluateHeaderImageOnImport(params: {
     return {
       ok: false,
       reason: "missing",
-      message: "No hay filas con teléfono válido para validar la imagen de cabecera.",
+      message: "No hay filas con teléfono válido para validar la cabecera con media.",
     };
   }
 
@@ -208,7 +235,7 @@ export function evaluateHeaderImageOnImport(params: {
     return {
       ok: false,
       reason: "missing",
-      message: "No se pudo leer header_image_url para todas las filas válidas.",
+      message: "No se pudo leer la URL de la cabecera para todas las filas válidas.",
     };
   }
 
@@ -219,7 +246,7 @@ export function evaluateHeaderImageOnImport(params: {
       ok: false,
       reason: "missing",
       message:
-        "Todas las filas válidas deben incluir la misma header_image_url (https). Completá la columna en cada fila.",
+        "Todas las filas válidas deben incluir la misma URL de cabecera (https). Completá la columna en cada fila.",
     };
   }
 
@@ -231,7 +258,7 @@ export function evaluateHeaderImageOnImport(params: {
       ok: false,
       reason: "multiple",
       message:
-        "En esta fase la campaña admite una sola imagen. Todas las filas deben usar la misma header_image_url.",
+        "En esta fase la campaña admite una sola URL de cabecera. Todas las filas deben usar la misma URL.",
     };
   }
 
@@ -240,7 +267,7 @@ export function evaluateHeaderImageOnImport(params: {
     return {
       ok: false,
       reason: "invalid",
-      message: "La header_image_url debe ser una URL https válida y accesible públicamente.",
+      message: "La URL de la cabecera debe ser https válida y accesible públicamente.",
     };
   }
 
