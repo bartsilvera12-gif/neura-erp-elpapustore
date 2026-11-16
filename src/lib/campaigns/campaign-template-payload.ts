@@ -20,7 +20,7 @@ import { extractBodyPlaceholderKeysOrdered } from "@/lib/campaigns/campaign-plac
 import {
   isHttpsUrl,
   logTemplatePayloadHeaderImage,
-  templateSnapshotHasHeaderImage,
+  templateSnapshotHeaderMediaFormat,
 } from "@/lib/campaigns/campaign-header-image";
 
 export type CampaignTemplateVarsResolvedLog = {
@@ -54,25 +54,26 @@ export function buildMetaCloudTemplatePayload(params: {
   headerImageUrl?: string | null;
 }): Record<string, unknown> {
   const components: Array<Record<string, unknown>> = [];
-  const needsHeader = templateSnapshotHasHeaderImage(params.componentsSnapshot);
+  const headerFormat = templateSnapshotHeaderMediaFormat(params.componentsSnapshot);
   const headerUrl = String(params.headerImageUrl ?? "").trim();
 
-  if (needsHeader && headerUrl && isHttpsUrl(headerUrl)) {
+  if (headerFormat && headerUrl && isHttpsUrl(headerUrl)) {
     try {
       logTemplatePayloadHeaderImage(new URL(headerUrl).hostname);
     } catch {
       logTemplatePayloadHeaderImage("(parse)");
     }
+    const link = headerUrl.slice(0, 4000);
+    // Cada formato de header usa una key distinta en el parámetro de Meta.
+    const headerParam: Record<string, unknown> =
+      headerFormat === "VIDEO"
+        ? { type: "video", video: { link } }
+        : headerFormat === "DOCUMENT"
+          ? { type: "document", document: { link, filename: "documento" } }
+          : { type: "image", image: { link } };
     components.push({
       type: "header",
-      parameters: [
-        {
-          type: "image",
-          image: {
-            link: headerUrl.slice(0, 4000),
-          },
-        },
-      ],
+      parameters: [headerParam],
     });
   }
 

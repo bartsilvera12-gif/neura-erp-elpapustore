@@ -225,10 +225,11 @@ export default function CampanasDetailClient({
   const templateHasHeaderImage = useMemo(() => {
     const vs = campaign?.template_components_json as unknown;
     if (!vs || !Array.isArray(vs)) return false;
+    // Cabecera con media (imagen, video o PDF): todas exigen una URL por envío.
     return (vs as { type?: string; format?: string }[]).some(
       (c) =>
         String(c.type ?? "").toUpperCase() === "HEADER" &&
-        String(c.format ?? "").toUpperCase() === "IMAGE"
+        ["IMAGE", "VIDEO", "DOCUMENT"].includes(String(c.format ?? "").toUpperCase())
     );
   }, [campaign]);
 

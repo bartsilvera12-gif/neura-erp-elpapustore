@@ -2,8 +2,13 @@ import "server-only";
 import * as XLSX from "xlsx";
 import { normalizeCampaignPhone } from "@/lib/campaigns/campaign-phone";
 
-export const CAMPAIGN_IMPORT_MAX_ROWS = 5000;
-export const CAMPAIGN_IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+/** Re-export por compatibilidad: la fuente de verdad es `campaign-import-limits`. */
+export {
+  CAMPAIGN_IMPORT_MAX_ROWS,
+  CAMPAIGN_IMPORT_MAX_BYTES,
+  formatCampaignImportMaxRows,
+  formatCampaignImportMaxSize,
+} from "@/lib/campaigns/campaign-import-limits";
 
 export type ParsedSheet = {
   headers: string[];
@@ -80,7 +85,11 @@ export function parseCampaignSpreadsheet(buffer: Buffer, filename: string): Pars
     headers.forEach((h, j) => {
       row[h] = line[j] != null ? String(line[j]).trim() : "";
     });
-    rows.push(row);
+    // Excel arrastra filas totalmente vacías en el "rango usado" del sheet.
+    // Las descartamos acá para no inflar el conteo de inválidos.
+    if (Object.values(row).some((v) => String(v ?? "").trim() !== "")) {
+      rows.push(row);
+    }
   }
 
   return { headers, rows };

@@ -25,6 +25,7 @@ type TemplateOpt = {
   id: string;
   name: string;
   language: string;
+  category: string | null;
   components_json: unknown[];
   variable_schema_json: Record<string, unknown>;
 };
@@ -171,6 +172,7 @@ export default function CampanasNuevoClient({
         template_id: selectedTemplate.id,
         template_name: selectedTemplate.name,
         template_language: selectedTemplate.language,
+        template_category: selectedTemplate.category,
         template_components_json: selectedTemplate.components_json,
         variable_mapping_json: mapping,
       }),

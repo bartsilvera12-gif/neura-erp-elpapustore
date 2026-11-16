@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { fetchWithSupabaseSession } from "@/lib/api/fetch-with-supabase-session";
 import { FancySelect } from "@/app/dashboard/proyectos/components/FancySelect";
@@ -14,6 +15,7 @@ type CampaignRow = {
   provider: string;
   template_name: string;
   template_language: string;
+  template_category: string | null;
   status: string;
   total_count: number;
   sent_count: number;
@@ -59,6 +61,17 @@ function statusConfig(status: string): { cls: string; dot: string; label: string
     dot: "bg-slate-400",
     label: status || "—",
   };
+}
+
+function categoryConfig(category: string | null): { cls: string; label: string } {
+  const c = (category ?? "").toUpperCase();
+  if (c === "MARKETING")
+    return { cls: "border-violet-200 bg-violet-50 text-violet-700", label: "Marketing" };
+  if (c === "UTILITY")
+    return { cls: "border-sky-200 bg-sky-50 text-sky-700", label: "Utilidad" };
+  if (c === "AUTHENTICATION")
+    return { cls: "border-amber-200 bg-amber-50 text-amber-800", label: "Autenticación" };
+  return { cls: "border-slate-200 bg-slate-50 text-slate-500", label: category || "—" };
 }
 
 export default function CampanasListClient() {
@@ -135,7 +148,9 @@ export default function CampanasListClient() {
       if (filtroEstado && r.status !== filtroEstado) return false;
       if (filtroProveedor && r.provider !== filtroProveedor) return false;
       if (!q) return true;
-      const t = [r.name, r.template_name, r.provider, r.status].join(" ").toLowerCase();
+      const t = [r.name, r.template_name, r.template_category, r.provider, r.status]
+        .join(" ")
+        .toLowerCase();
       return t.includes(q);
     });
   }, [rows, busqueda, filtroEstado, filtroProveedor]);
@@ -203,6 +218,19 @@ export default function CampanasListClient() {
             Envíos masivos con plantillas aprobadas (Meta / YCloud).
           </p>
         </div>
+        <div className="flex shrink-0 items-center gap-2">
+        <Link
+          href="/dashboard/campanas/audiencias"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#4FAEB2]/40 bg-white px-3 py-1.5 text-xs font-semibold text-[#3F8E91] shadow-sm transition-colors hover:bg-[#4FAEB2]/10"
+        >
+          Audiencias
+        </Link>
+        <Link
+          href="/dashboard/campanas/plantillas"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#4FAEB2]/40 bg-white px-3 py-1.5 text-xs font-semibold text-[#3F8E91] shadow-sm transition-colors hover:bg-[#4FAEB2]/10"
+        >
+          Plantillas de Meta
+        </Link>
         <button
           type="button"
           onClick={() => setNuevoOpen(true)}
@@ -219,6 +247,7 @@ export default function CampanasListClient() {
           </svg>
           Nueva campaña
         </button>
+        </div>
       </div>
 
       {/* KPIs */}
@@ -338,6 +367,7 @@ export default function CampanasListClient() {
                     "Nombre",
                     "Proveedor",
                     "Plantilla",
+                    "Categoría",
                     "Estado",
                     "Total",
                     "Enviados",
@@ -347,7 +377,7 @@ export default function CampanasListClient() {
                     <th
                       key={h}
                       className={`whitespace-nowrap px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500 ${
-                        i >= 4 ? "text-right" : "text-left"
+                        i >= 5 ? "text-right" : "text-left"
                       }`}
                     >
                       {h}
@@ -377,6 +407,18 @@ export default function CampanasListClient() {
                         <span className="text-[11px] text-slate-400">
                           ({r.template_language})
                         </span>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        {(() => {
+                          const cat = categoryConfig(r.template_category);
+                          return (
+                            <span
+                              className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold ${cat.cls}`}
+                            >
+                              {cat.label}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="px-3 py-2.5">
                         <span
