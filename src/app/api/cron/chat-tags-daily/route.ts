@@ -4,6 +4,7 @@ import type { Pool } from "pg";
 import { getChatPostgresPool } from "@/lib/supabase/chat-pg-pool";
 import { assertAllowedChatDataSchema } from "@/lib/supabase/chat-data-schema";
 import { schemaHasHiddenByTagColumn } from "@/lib/chat/tags/has-hidden-by-tag-column";
+import { schemaHasBulkCategoryFn } from "@/lib/chat/tags/has-bulk-category-fn";
 import { getSingleClientSchemaOrNull } from "@/lib/instance/single-client";
 
 /**
@@ -132,6 +133,19 @@ async function processTenant(
     };
   }
 
+  // Optimización: si el schema expone el clasificador set-based, se calcula la
+  // categoría de TODAS las conversaciones en una pasada (CTE con el bulk, ~2 s)
+  // en vez de llamar la función fila-por-fila por cada candidata y por cada
+  // bucket (con ~68k conversaciones ×5 buckets tardaba ~165 s/bucket y saturaba
+  // la base compartida). Fallback transparente a la función original cuando el
+  // schema no tiene el bulk. Paridad verificada: 0 diferencias func vs bulk.
+  const useBulk = await schemaHasBulkCategoryFn(pool, schema);
+  console.info("[chat-tags][cron-daily] clasificador", {
+    empresa_id_short: empresaShort,
+    schema,
+    modo: useBulk ? "bulk_set_based" : "fila_por_fila_fallback",
+  });
+
   // Resolver tag_id + rule_id por bucket.
   const resolved: Array<{
     tag_code: string;
@@ -177,7 +191,25 @@ async function processTenant(
     for (const r of resolved) {
       // Eligibles directos (NO usa snapshot previo) — calcula categoría con clasificador v2.
       // Excluye conversaciones que ya tienen applied del mismo tag.
+      // La fuente de la categoría es el bulk (CTE) cuando el schema lo tiene, o
+      // la función fila-por-fila como fallback. El resto de los filtros de
+      // elegibilidad es IDÉNTICO en ambos caminos (solo cambia de dónde sale la
+      // categoría), por eso el conjunto de candidatas no varía.
+      const catCte = useBulk
+        ? `WITH cats AS (
+             SELECT conversation_id, category
+               FROM "${schema}".chat_tag_purchase_category_bulk($1)
+           )`
+        : "";
+      const catClause = useBulk
+        ? `AND EXISTS (
+             SELECT 1 FROM cats
+              WHERE cats.conversation_id = c.id
+                AND cats.category = $2
+           )`
+        : `AND "${schema}".chat_tag_purchase_category(c.id) = $2`;
       const sql = `
+        ${catCte}
         SELECT c.id::text AS conv_id,
                c.contact_id::text AS contact_id,
                c.last_message_at,
@@ -192,7 +224,7 @@ async function processTenant(
            AND (c.flow_status IS NULL OR c.flow_status <> 'human')
            AND c.last_message_at < now() - interval '7 days'
            AND c.closed_by_usuario_id IS NULL
-           AND "${schema}".chat_tag_purchase_category(c.id) = $2
+           ${catClause}
            AND NOT EXISTS (
              SELECT 1 FROM "${schema}".chat_conversation_tag_history hp
               WHERE hp.empresa_id = $1
