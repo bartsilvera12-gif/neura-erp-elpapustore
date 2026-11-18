@@ -76,6 +76,18 @@ export async function findPaidPurchasePendingOrder(
     // Sin orden posterior sí se reanuda aunque pasen meses: pagó y nunca recibió sus boletas.
     const desde = String(v.created_at ?? "").trim();
     if (!desde) return null;
+
+    // Un pago de un sorteo anterior no se reanuda en el sorteo actual: si el sorteo activo se
+    // creó después del comprobante, ese pago era para otro sorteo (ya cerrado). Pasó con 13
+    // órdenes de noviembre (Edición Sportage GT) entregadas con pagos de agosto a octubre.
+    const { data: sorteoNuevo, error: sErr2 } = await supabase
+      .from("sorteos")
+      .select("id")
+      .eq("empresa_id", empresaId)
+      .eq("estado", "activo")
+      .gt("created_at", desde)
+      .limit(1);
+    if (sErr2 || (Array.isArray(sorteoNuevo) && sorteoNuevo.length > 0)) return null;
     const { data: posteriorConv, error: pcErr } = await supabase
       .from("sorteo_entradas")
       .select("id")
