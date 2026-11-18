@@ -1,8 +1,5 @@
 import type { SupabaseAdmin } from "@/lib/chat/types";
 
-/** Antigüedad máxima del comprobante para reanudar una compra pagada sin orden (30 días). */
-const PAID_PURCHASE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-
 /**
  * ¿La conversación tiene una compra YA PAGADA a la que todavía no se le creó la orden?
  *
@@ -25,11 +22,12 @@ export async function findPaidPurchasePendingOrder(
   try {
     const { data: conv, error: cErr } = await supabase
       .from("chat_conversations")
-      .select("active_flow_session_id")
+      .select("active_flow_session_id, contact_id")
       .eq("id", conversationId)
       .eq("empresa_id", empresaId)
       .maybeSingle();
-    const sid = (conv as { active_flow_session_id?: string | null } | null)?.active_flow_session_id?.trim();
+    const convRow = conv as { active_flow_session_id?: string | null; contact_id?: string | null } | null;
+    const sid = convRow?.active_flow_session_id?.trim();
     if (cErr || !sid) return null;
 
     const { data: sess, error: sErr } = await supabase
@@ -60,14 +58,6 @@ export async function findPaidPurchasePendingOrder(
       manual_approval_at?: string | null;
     } | null;
     if (vErr || !v) return null;
-    // Ticket 569: un pago viejo (sesión abandonada hace meses) no debe "reanudarse" ni generar
-    // una orden nueva cuando el comprador vuelve a escribir: se inicia una compra nueva y el
-    // comprobante viejo queda para revisión administrativa.
-    const refMs = Math.max(
-      Date.parse(String(v.created_at ?? "")) || 0,
-      Date.parse(String(v.manual_approval_at ?? "")) || 0
-    );
-    if (!refMs || Date.now() - refMs > PAID_PURCHASE_MAX_AGE_MS) return null;
     const estado = String(v.estado_validacion ?? "").trim().toLowerCase();
     if (estado !== "valido" && estado !== "aprobado_manual") return null;
     if (v.sorteo_entrada_id) return null;
@@ -78,6 +68,46 @@ export async function findPaidPurchasePendingOrder(
       .eq("comprobante_validacion_id", validationId)
       .limit(1);
     if (eErr || (Array.isArray(ent) && ent.length > 0)) return null;
+
+    // Ticket 569: si el comprador ya tiene una orden creada DESPUÉS de este comprobante (por el bot
+    // en otra sesión o cargada a mano en el ERP, que no queda vinculada al comprobante), ese pago
+    // ya se usó: no se reanuda. Caso: pago del 02/05 aprobado a mano, orden 2745 cargada a mano el
+    // 13/05 y el 18/11 el bot "reanudó" la compra y entregó la orden 4826 sin pago nuevo.
+    // Sin orden posterior sí se reanuda aunque pasen meses: pagó y nunca recibió sus boletas.
+    const desde = String(v.created_at ?? "").trim();
+    if (!desde) return null;
+    const { data: posteriorConv, error: pcErr } = await supabase
+      .from("sorteo_entradas")
+      .select("id")
+      .eq("empresa_id", empresaId)
+      .eq("chat_conversation_id", conversationId)
+      .gt("created_at", desde)
+      .is("anulada_at", null)
+      .limit(1);
+    if (pcErr || (Array.isArray(posteriorConv) && posteriorConv.length > 0)) return null;
+
+    const contactId = convRow?.contact_id?.trim();
+    if (contactId) {
+      const { data: contacto } = await supabase
+        .from("chat_contacts")
+        .select("phone_normalized, phone_number")
+        .eq("id", contactId)
+        .maybeSingle();
+      const c = contacto as { phone_normalized?: string | null; phone_number?: string | null } | null;
+      // Últimos 9 dígitos: las órdenes cargadas a mano guardan 0981…, las del bot 595981….
+      const ultimos9 = String(c?.phone_normalized || c?.phone_number || "").replace(/\D/g, "").slice(-9);
+      if (ultimos9.length === 9) {
+        const { data: posteriorTel, error: ptErr } = await supabase
+          .from("sorteo_entradas")
+          .select("id")
+          .eq("empresa_id", empresaId)
+          .like("whatsapp_numero", `%${ultimos9}`)
+          .gt("created_at", desde)
+          .is("anulada_at", null)
+          .limit(1);
+        if (ptErr || (Array.isArray(posteriorTel) && posteriorTel.length > 0)) return null;
+      }
+    }
 
     return { flowSessionId: sid, validationId };
   } catch {
