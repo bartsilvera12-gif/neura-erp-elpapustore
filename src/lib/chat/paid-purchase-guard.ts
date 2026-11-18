@@ -1,5 +1,8 @@
 import type { SupabaseAdmin } from "@/lib/chat/types";
 
+/** Antigüedad máxima del comprobante para reanudar una compra pagada sin orden (30 días). */
+const PAID_PURCHASE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
 /**
  * ¿La conversación tiene una compra YA PAGADA a la que todavía no se le creó la orden?
  *
@@ -47,11 +50,24 @@ export async function findPaidPurchasePendingOrder(
 
     const { data: val, error: vErr } = await supabase
       .from("chat_comprobante_validaciones")
-      .select("estado_validacion, sorteo_entrada_id")
+      .select("estado_validacion, sorteo_entrada_id, created_at, manual_approval_at")
       .eq("id", validationId)
       .maybeSingle();
-    const v = val as { estado_validacion?: string | null; sorteo_entrada_id?: string | null } | null;
+    const v = val as {
+      estado_validacion?: string | null;
+      sorteo_entrada_id?: string | null;
+      created_at?: string | null;
+      manual_approval_at?: string | null;
+    } | null;
     if (vErr || !v) return null;
+    // Ticket 569: un pago viejo (sesión abandonada hace meses) no debe "reanudarse" ni generar
+    // una orden nueva cuando el comprador vuelve a escribir: se inicia una compra nueva y el
+    // comprobante viejo queda para revisión administrativa.
+    const refMs = Math.max(
+      Date.parse(String(v.created_at ?? "")) || 0,
+      Date.parse(String(v.manual_approval_at ?? "")) || 0
+    );
+    if (!refMs || Date.now() - refMs > PAID_PURCHASE_MAX_AGE_MS) return null;
     const estado = String(v.estado_validacion ?? "").trim().toLowerCase();
     if (estado !== "valido" && estado !== "aprobado_manual") return null;
     if (v.sorteo_entrada_id) return null;
