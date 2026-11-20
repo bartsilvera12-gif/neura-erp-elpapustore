@@ -93,6 +93,11 @@ export interface ComprobanteValidationSettings {
    * Si true (por defecto), un comprobante sin monto legible no se aprueba solo: va a revisión manual.
    */
   revision_manual_sin_monto_ocr: boolean;
+  /**
+   * Si true, un comprobante sin ningún texto de transferencia terminada (exitosa, N° de operación,
+   * "Procesando transferencia"…) va a revisión manual en vez de aprobarse solo. Por defecto false.
+   */
+  revision_manual_sin_confirmacion_transferencia: boolean;
   messages: ComprobanteValidationMessages;
   ocr_fields: Record<OcrFieldKey, OcrFieldRule>;
 }
@@ -199,6 +204,7 @@ export function defaultComprobanteValidationSettings(): ComprobanteValidationSet
     ocr_fallo_comportamiento: "revision_manual",
     bloquear_transferencia_en_proceso: true,
     revision_manual_sin_monto_ocr: true,
+    revision_manual_sin_confirmacion_transferencia: false,
     messages: { ...DEFAULT_COMPROBANTE_VALIDATION_MESSAGES },
     ocr_fields: {
       monto: defaultOcrFieldRule({ analyzed: true, required: false, on_missing: "continuar" }),
@@ -385,6 +391,10 @@ export function parseComprobanteValidationConfig(config: unknown): ComprobanteVa
       base.bloquear_transferencia_en_proceso
     ),
     revision_manual_sin_monto_ocr: boolOr(r.revision_manual_sin_monto_ocr, base.revision_manual_sin_monto_ocr),
+    revision_manual_sin_confirmacion_transferencia: boolOr(
+      r.revision_manual_sin_confirmacion_transferencia,
+      base.revision_manual_sin_confirmacion_transferencia
+    ),
     messages: mergedMessages,
     ocr_fields: ocrMerged,
   };
@@ -413,6 +423,7 @@ export function comprobanteValidationSettingsForForm(
     ocr_fallo_comportamiento: settings.ocr_fallo_comportamiento,
     bloquear_transferencia_en_proceso: settings.bloquear_transferencia_en_proceso,
     revision_manual_sin_monto_ocr: settings.revision_manual_sin_monto_ocr,
+    revision_manual_sin_confirmacion_transferencia: settings.revision_manual_sin_confirmacion_transferencia,
     messages: { ...settings.messages },
     ocr_fields: JSON.parse(JSON.stringify(settings.ocr_fields)),
   };

@@ -76,6 +76,12 @@ const SUCCESS_MARKERS = [
   "nueva transferencia",
   "compartir comprobante",
   "ya solicitamos el envio",
+  "con exito",
+  "procesando transferencia",
+  "detalle de transferencia",
+  "monto debitado",
+  "n de comprobante",
+  "enviado por",
 ] as const;
 
 /** Minúsculas, sin acentos, solo letras/dígitos separados por un espacio. */
@@ -105,3 +111,4 @@ export function assessTransferCompletion(ocrText: string): TransferCompletionAss
 
 export const MOTIVO_TRANSFERENCIA_NO_FINALIZADA = "transferencia_no_finalizada";
 export const MOTIVO_MONTO_NO_DETECTADO = "monto_no_detectado_revision";
+export const MOTIVO_TRANSFERENCIA_SIN_CONFIRMACION = "transferencia_sin_confirmacion_revision";

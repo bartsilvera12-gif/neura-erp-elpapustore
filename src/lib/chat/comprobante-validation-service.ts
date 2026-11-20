@@ -26,6 +26,7 @@ import { runGoogleVisionDocumentOcr } from "@/lib/chat/comprobante-vision-ocr";
 import {
   assessTransferCompletion,
   MOTIVO_MONTO_NO_DETECTADO,
+  MOTIVO_TRANSFERENCIA_SIN_CONFIRMACION,
   MOTIVO_TRANSFERENCIA_NO_FINALIZADA,
 } from "@/lib/chat/comprobante-transfer-completion";
 import {
@@ -691,6 +692,8 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
     settings.bloquear_transferencia_en_proceso && completion.status === "en_proceso";
   const montoNoDetectado =
     settings.revision_manual_sin_monto_ocr && parseMontoOcrDigitsToGs(extracted.monto) == null;
+  const sinConfirmacionTransferencia =
+    settings.revision_manual_sin_confirmacion_transferencia && completion.status !== "completada";
   if (transferenciaEnProceso || montoNoDetectado || completion.status !== "completada") {
     console.info("[sorteo-comprobante][transfer-completion]", {
       empresa_id: ctx.empresaId,
@@ -745,6 +748,9 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
   } else if (montoNoDetectado) {
     estado = "revision_manual";
     motivo = MOTIVO_MONTO_NO_DETECTADO;
+  } else if (sinConfirmacionTransferencia) {
+    estado = "revision_manual";
+    motivo = MOTIVO_TRANSFERENCIA_SIN_CONFIRMACION;
   } else if (sospecha) {
     estado = "revision_manual";
     motivo = "ocr_texto_corto_sospecha";

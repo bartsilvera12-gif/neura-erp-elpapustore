@@ -170,6 +170,31 @@ async function main() {
     ok("pipeline: comprobante sin monto legible → revision_manual (no se aprueba solo)");
   }
   {
+    const confirmPantalla =
+      "< Transferencias bancarias\nImporte Débito\nGs. 10.000\nRUC\n80170499-5\nEL PAPU COMPANY E.A.S.\nConcepto\nSorteo";
+    const r1 = await run(confirmPantalla, settings);
+    assert(r1.kind === "resolved" && r1.estado === "valido", "sin la opción, pantalla ambigua con monto sigue válida");
+    const estricto = { ...settings, revision_manual_sin_confirmacion_transferencia: true };
+    const r2 = await run(confirmPantalla, estricto);
+    assert(r2.kind === "resolved" && r2.estado === "revision_manual", "con la opción → revisión manual");
+    const r3 = await run(OCR_COMPROBANTE_OK, estricto);
+    assert(r3.kind === "resolved" && r3.estado === "valido", "con la opción, comprobante final sigue válido");
+    ok("opción estricta: pantalla ambigua (20-may) → revision_manual; comprobante final → valido");
+  }
+  {
+    const reales = [
+      "continental\nDetalle de transferencia\n20/11/2026 - 08:24:03\nComprobante\nMonto debitado\n254263588\n20.000 GS.",
+      "Monto\nGs. 20.000\nBNF\nOrigen\nEL PAPU COMPANY\nEstado\nProcesando transferencia\nmango",
+      "¡Transferencia cargada con éxito!\nMonto a enviar\nGs. 10.000\nEnviado por\nIdalina",
+      "Envío\n$ 10.000\nEnviado por\nMathias\nN° de Comprobante\n1056882019",
+    ];
+    for (const t of reales) {
+      const a = assessTransferCompletion(t);
+      assert(a.status === "completada", `comprobante 20-nov debe ser completada: ${t.slice(0, 40)}`);
+    }
+    ok("comprobantes reales del 20-nov (Continental, Mango, BNF, Familiar) → completada");
+  }
+  {
     const legacy = {
       ...settings,
       bloquear_transferencia_en_proceso: false,
