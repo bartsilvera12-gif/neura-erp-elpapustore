@@ -36,6 +36,8 @@ export interface ComprobanteValidationMessages {
   monto_incoherente: string;
   /** Datos bancarios del OCR no coinciden con los configurados en el canal (opt-in). */
   datos_bancarios_incoherentes: string;
+  /** La imagen es una pantalla de la app del banco a mitad de la transferencia (formulario, confirmación). */
+  transferencia_incompleta: string;
   boton_otro_titulo: string;
   boton_asesor_titulo: string;
 }
@@ -82,6 +84,15 @@ export interface ComprobanteValidationSettings {
   ocr_min_chars_sospecha: number;
   /** Cuando falla OCR o PDF sin OCR automático. */
   ocr_fallo_comportamiento: OnMissingBehavior;
+  /**
+   * Si true (por defecto), una captura de la app del banco a mitad de la operación (formulario de
+   * destinatario, pantalla de confirmación, token) se rechaza y se pide el comprobante final.
+   */
+  bloquear_transferencia_en_proceso: boolean;
+  /**
+   * Si true (por defecto), un comprobante sin monto legible no se aprueba solo: va a revisión manual.
+   */
+  revision_manual_sin_monto_ocr: boolean;
   messages: ComprobanteValidationMessages;
   ocr_fields: Record<OcrFieldKey, OcrFieldRule>;
 }
@@ -153,6 +164,8 @@ export const DEFAULT_COMPROBANTE_VALIDATION_MESSAGES: ComprobanteValidationMessa
     "El comprobante recibido no coincide con el monto seleccionado. Podés reenviar el comprobante o hablar con un asesor.",
   datos_bancarios_incoherentes:
     "El comprobante no coincide con los datos bancarios esperados. Podés reenviar el comprobante o hablar con un asesor.",
+  transferencia_incompleta:
+    "La imagen parece una pantalla de la transferencia todavía en proceso, no el comprobante final. Terminá la transferencia y enviá la captura del comprobante donde figure el monto y el número de operación.",
   boton_otro_titulo: "Otro comprobante",
   boton_asesor_titulo: "Hablar con asesor",
 };
@@ -184,6 +197,8 @@ export function defaultComprobanteValidationSettings(): ComprobanteValidationSet
     revision_manual_activar_takeover: false,
     ocr_min_chars_sospecha: 24,
     ocr_fallo_comportamiento: "revision_manual",
+    bloquear_transferencia_en_proceso: true,
+    revision_manual_sin_monto_ocr: true,
     messages: { ...DEFAULT_COMPROBANTE_VALIDATION_MESSAGES },
     ocr_fields: {
       monto: defaultOcrFieldRule({ analyzed: true, required: false, on_missing: "continuar" }),
@@ -272,6 +287,10 @@ export function parseComprobanteValidationConfig(config: unknown): ComprobanteVa
       typeof messages.datos_bancarios_incoherentes === "string" && messages.datos_bancarios_incoherentes.trim()
         ? messages.datos_bancarios_incoherentes.trim()
         : base.messages.datos_bancarios_incoherentes,
+    transferencia_incompleta:
+      typeof messages.transferencia_incompleta === "string" && messages.transferencia_incompleta.trim()
+        ? messages.transferencia_incompleta.trim()
+        : base.messages.transferencia_incompleta,
   };
 
   const ocrFieldsRaw = r.ocr_fields;
@@ -361,6 +380,11 @@ export function parseComprobanteValidationConfig(config: unknown): ComprobanteVa
         ? Math.min(500, Math.trunc(r.ocr_min_chars_sospecha))
         : base.ocr_min_chars_sospecha,
     ocr_fallo_comportamiento: isOnMissingBehavior(fallo) ? fallo : base.ocr_fallo_comportamiento,
+    bloquear_transferencia_en_proceso: boolOr(
+      r.bloquear_transferencia_en_proceso,
+      base.bloquear_transferencia_en_proceso
+    ),
+    revision_manual_sin_monto_ocr: boolOr(r.revision_manual_sin_monto_ocr, base.revision_manual_sin_monto_ocr),
     messages: mergedMessages,
     ocr_fields: ocrMerged,
   };
@@ -387,6 +411,8 @@ export function comprobanteValidationSettingsForForm(
     revision_manual_activar_takeover: settings.revision_manual_activar_takeover,
     ocr_min_chars_sospecha: settings.ocr_min_chars_sospecha,
     ocr_fallo_comportamiento: settings.ocr_fallo_comportamiento,
+    bloquear_transferencia_en_proceso: settings.bloquear_transferencia_en_proceso,
+    revision_manual_sin_monto_ocr: settings.revision_manual_sin_monto_ocr,
     messages: { ...settings.messages },
     ocr_fields: JSON.parse(JSON.stringify(settings.ocr_fields)),
   };

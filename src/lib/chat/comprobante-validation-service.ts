@@ -24,8 +24,14 @@ import {
 } from "@/lib/chat/comprobante-validation-types";
 import { runGoogleVisionDocumentOcr } from "@/lib/chat/comprobante-vision-ocr";
 import {
+  assessTransferCompletion,
+  MOTIVO_MONTO_NO_DETECTADO,
+  MOTIVO_TRANSFERENCIA_NO_FINALIZADA,
+} from "@/lib/chat/comprobante-transfer-completion";
+import {
   DEFAULT_MONTO_FIELDS_PRIORIDAD,
   fetchExpectedMontoGsFromFlowSession,
+  parseMontoOcrDigitsToGs,
   validateReceiptAmountAgainstFlow,
 } from "@/lib/chat/comprobante-monto-flow-validation";
 import {
@@ -680,6 +686,23 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
     }
   }
 
+  const completion = assessTransferCompletion(fullText);
+  const transferenciaEnProceso =
+    settings.bloquear_transferencia_en_proceso && completion.status === "en_proceso";
+  const montoNoDetectado =
+    settings.revision_manual_sin_monto_ocr && parseMontoOcrDigitsToGs(extracted.monto) == null;
+  if (transferenciaEnProceso || montoNoDetectado || completion.status !== "completada") {
+    console.info("[sorteo-comprobante][transfer-completion]", {
+      empresa_id: ctx.empresaId,
+      conversation_id: ctx.conversationId,
+      flow_session_id: sid,
+      status: completion.status,
+      form_markers: completion.form_markers,
+      success_markers: completion.success_markers,
+      monto_detectado: !montoNoDetectado,
+    });
+  }
+
   // --- Sospecha heurística (solo si hubo texto OCR; si OCR es opcional y vino vacío, no forzar revisión por longitud) ---
   const sospecha =
     settings.revision_manual_si_sospecha_ocr &&
@@ -697,6 +720,9 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
   } else if (ocrFingerprintWeakDup) {
     estado = "revision_manual";
     motivo = MOTIVO_REVISION_HUELLA_OCR_DEBIL;
+  } else if (transferenciaEnProceso) {
+    estado = "ocr_error";
+    motivo = `${MOTIVO_TRANSFERENCIA_NO_FINALIZADA}:${completion.form_markers.slice(0, 5).join(",")}`;
   } else if (missingWorst === "bloquear") {
     estado = "ocr_error";
     motivo = `campo_obligatorio:${missingParts.join(",")}`;
@@ -716,6 +742,9 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
   } else if (bankFlowResult.apply && !bankFlowResult.ok) {
     estado = "datos_bancarios_incoherentes";
     motivo = bankFlowResult.motivoDetalle ?? "datos_bancarios:discrepancia";
+  } else if (montoNoDetectado) {
+    estado = "revision_manual";
+    motivo = MOTIVO_MONTO_NO_DETECTADO;
   } else if (sospecha) {
     estado = "revision_manual";
     motivo = "ocr_texto_corto_sospecha";
@@ -829,6 +858,27 @@ export async function runComprobanteValidationPipeline(ctx: PipelineCtx): Promis
     };
   }
 
+  if (transferenciaEnProceso) {
+    return {
+      kind: "resolved",
+      validationId,
+      estado,
+      motivo,
+      flowUpserts,
+      advance: false,
+      sendInteractive: {
+        body: settings.messages.transferencia_incompleta,
+        buttons: [
+          { id: COMPROBANTE_BUTTON_IDS.enviar_otro, title: settings.messages.boton_otro_titulo.slice(0, 20) },
+          {
+            id: COMPROBANTE_BUTTON_IDS.hablar_asesor,
+            title: settings.messages.boton_asesor_titulo.slice(0, 20),
+          },
+        ],
+      },
+    };
+  }
+
   if (estado === "ocr_error" && missingWorst === "bloquear") {
     return {
       kind: "resolved",
@@ -912,6 +962,11 @@ export async function mensajeClienteComprobanteNoValido(
   if (estado === "duplicado_ocr") return s.messages.ocr_duplicado;
   if (estado === "monto_incoherente") return s.messages.monto_incoherente;
   if (estado === "datos_bancarios_incoherentes") return s.messages.datos_bancarios_incoherentes;
-  if (estado === "ocr_error") return s.messages.ocr_insuficiente;
+  if (estado === "ocr_error") {
+    if ((motivoValidacion ?? "").startsWith(MOTIVO_TRANSFERENCIA_NO_FINALIZADA)) {
+      return s.messages.transferencia_incompleta;
+    }
+    return s.messages.ocr_insuficiente;
+  }
   return DEFAULT_MSG_COMPROBANTE_NO_CIERRA;
 }
