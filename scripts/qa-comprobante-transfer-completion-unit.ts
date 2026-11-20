@@ -85,6 +85,22 @@ Banco Continental`;
   ok("éxito + 'Siguiente' → completada");
 }
 
+// Capturas históricas que se habían aprobado (OCR real, recortado).
+{
+  const historicos: Record<string, string> = {
+    "25-oct alias": "< Atrás\nAlias\n801.704.995\nDocumento\nTipo de documento\nCelular\nRecordar esta cuenta",
+    "07-oct monto": "Transferencias\nCuánto dinero querés enviar?\n10.000\nSaldo disponible: 316.502 Gs.\nSiguiente",
+    "20-sep alias error": "Alias\n801704995\nAlias no encontrado, verificá el dato\ningresado e intenta de nuevo.\nOK",
+    "23-ago alias error": "seleccioná una cuenta o alias\ntipo de alias\nRUC\n801704995\nno se encontró el alias\nsiguiente",
+    "03-jul monto": "Alias SIP\nEL PAPU COMPANY E.A.S.\nCuenta\n6192902141\nMonto a Transferir\nGs. 20.000",
+  };
+  for (const [k, v] of Object.entries(historicos)) {
+    const a = assessTransferCompletion(v);
+    assert(a.status === "en_proceso", `${k}: debe ser en_proceso, fue ${a.status}`);
+    ok(`histórico ${k} → en_proceso`);
+  }
+}
+
 // --- Pipeline real con DB falsa ---
 function fakeSupabase() {
   const chain: Record<string, unknown> = {};

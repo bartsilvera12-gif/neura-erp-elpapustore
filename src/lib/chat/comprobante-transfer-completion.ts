@@ -33,6 +33,14 @@ const FORM_MARKERS = [
   "monto a transferir",
   "cuanto queres transferir",
   "a quien queres transferir",
+  "cuanto dinero queres enviar",
+  "saldo disponible",
+  "alias no encontrado",
+  "no se encontro el alias",
+  "verifica el dato",
+  "recordar esta cuenta",
+  "selecciona una cuenta",
+  "disculpe los inconvenientes",
   "siguiente",
 ] as const;
 
