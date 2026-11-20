@@ -40,9 +40,21 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(errorResponse(API_ERRORS.UNAUTHORIZED), { status: 401 });
     }
 
+    /**
+     * `?debug=1` (solo para verificar): devuelve POR QUÉ no hay cartel. Sin esto las tres causas
+     * posibles —no es admin, la consulta falló, no hay fallos— salen todas como `activo:false`,
+     * que es exactamente lo que hizo que 5.452 fallos pasaran desapercibidos.
+     */
+    const debug = request.nextUrl.searchParams.get("debug") === "1";
+
     /** Silencioso, no 403: el cartel simplemente no aparece para quien no es admin. */
     if (!esRolAdminEmpresaOGlobal(ctx.auth.rol)) {
-      return NextResponse.json(successResponse({ activo: false }));
+      return NextResponse.json(
+        successResponse({
+          activo: false,
+          ...(debug ? { motivo: "no_es_admin", rol: ctx.auth.rol ?? null } : {}),
+        })
+      );
     }
 
     const empresaId = ctx.auth.empresa_id;
@@ -72,12 +84,41 @@ export async function GET(request: NextRequest) {
     if (error) {
       /** Falla suave: el cartel no debe romper el ERP si la consulta no responde. */
       console.warn("[meta-billing-alert]", error.message);
-      return NextResponse.json(successResponse({ activo: false }));
+      return NextResponse.json(
+        successResponse({
+          activo: false,
+          ...(debug ? { motivo: "consulta_falló", error: error.message, schema_hint: "postgrest" } : {}),
+        })
+      );
     }
 
     const filas = (data ?? []) as Array<{ created_at?: string }>;
     if (filas.length === 0) {
-      return NextResponse.json(successResponse({ activo: false }));
+      if (!debug) {
+        return NextResponse.json(successResponse({ activo: false }));
+      }
+      /**
+       * Si el filtro no encontró nada, la duda es si la ruta JSON existe tal cual la escribimos.
+       * Esta muestra responde eso mirando el dato real, sin inventar hipótesis.
+       */
+      const muestra = await sb
+        .from("chat_messages")
+        .select("created_at, estado, neura_meta_status:raw_payload->neura_meta_status")
+        .eq("empresa_id", empresaId)
+        .eq("from_me", true)
+        .gte("created_at", desdeIso)
+        .order("created_at", { ascending: false })
+        .limit(5);
+      return NextResponse.json(
+        successResponse({
+          activo: false,
+          motivo: "sin_filas_con_ese_codigo",
+          ventana_horas: horas,
+          desde: desdeIso,
+          muestra_error: muestra.error?.message ?? null,
+          muestra: muestra.data ?? null,
+        })
+      );
     }
 
     const fechas = filas
