@@ -101,6 +101,23 @@ Banco Continental`;
   }
 }
 
+// Comprobantes reales que traen "Tipo de Documento" y no deben confundirse con un formulario.
+{
+  const reales: Record<string, string> = {
+    "31-oct finalizar":
+      "Transferencias bancarias\nFecha y Hora\nFecha de Imputación\nDatos de la transacción\nDetalle cuenta débito\nImporte Débito\nGs. 10.000\nNombre y Apellido\nEL PAPU COMPANY E.A.S. UNIPERSONAL\nTipo de Documento\nNúmero de Documento\nNUEVA TRANSFERENCIA\nFINALIZAR",
+    "02-jul sudameris":
+      "TRANSFERENCIA A OTROS\nBANCOS\nImporte Débito: GS 10.000\nTipo de Documento: RUC\nNúmero de Documento: 80170499-5\nImporte Crédito: GS 10.000\nReferencia:\nBSUDPYPX02072646800054029320",
+    "26-sep familiar":
+      "Envío\n$ 10.000\n¡Listo!\nEnviado por\nYa solicitamos el envío de tu dinero.\nCompartir comprobante",
+  };
+  for (const [k, v] of Object.entries(reales)) {
+    const a = assessTransferCompletion(v);
+    assert(a.status !== "en_proceso", `${k}: comprobante real no debe ser en_proceso`);
+    ok(`real ${k} → ${a.status}`);
+  }
+}
+
 // --- Pipeline real con DB falsa ---
 function fakeSupabase() {
   const chain: Record<string, unknown> = {};

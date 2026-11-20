@@ -14,12 +14,14 @@ export type TransferCompletionAssessment = {
   success_markers: string[];
 };
 
-/** Textos típicos de formularios / pasos previos al envío en apps bancarias PY. */
+/**
+ * Textos típicos de formularios / pasos previos al envío en apps bancarias PY.
+ * No incluir "tipo de documento": los comprobantes finales de Sudameris también lo muestran.
+ */
 const FORM_MARKERS = [
   "ingresa los datos",
   "persona que recibe",
   "sin puntos ni guiones",
-  "tipo de documento",
   "nombre email com",
   "confirmar transferencia",
   "confirma la transferencia",
@@ -69,6 +71,11 @@ const SUCCESS_MARKERS = [
   "id de transaccion",
   "numero de comprobante",
   "nro de comprobante",
+  "numero de soporte",
+  "fecha de imputacion",
+  "nueva transferencia",
+  "compartir comprobante",
+  "ya solicitamos el envio",
 ] as const;
 
 /** Minúsculas, sin acentos, solo letras/dígitos separados por un espacio. */
