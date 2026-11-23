@@ -126,6 +126,40 @@ export async function GET(request: NextRequest) {
       .filter((s) => s.length > 0)
       .sort();
 
+    const ultimoFallo = fechas[fechas.length - 1] ?? null;
+
+    /**
+     * ¿Se recuperó? Un solo mensaje entregado DESPUÉS del último fallo significa que Meta ya
+     * liberó la cuenta. Sin esto el cartel seguiría rojo 24 h después de resuelto, que es lo
+     * mismo que no avisar: si el cartel miente, se lo empieza a ignorar.
+     */
+    if (ultimoFallo) {
+      const { data: okData } = await sb
+        .from("chat_messages")
+        .select("created_at")
+        .eq("empresa_id", empresaId)
+        .eq("from_me", true)
+        .gt("created_at", ultimoFallo)
+        .in("raw_payload->neura_meta_status->>status", ["sent", "delivered", "read"])
+        .limit(1);
+      if ((okData ?? []).length > 0) {
+        return NextResponse.json(
+          successResponse({
+            activo: false,
+            ...(debug
+              ? {
+                  motivo: "resuelto",
+                  ultimo_fallo: ultimoFallo,
+                  entregado_despues: String(
+                    (okData as Array<{ created_at?: string }>)[0]?.created_at ?? ""
+                  ),
+                }
+              : {}),
+          })
+        );
+      }
+    }
+
     return NextResponse.json(
       successResponse({
         activo: true,
