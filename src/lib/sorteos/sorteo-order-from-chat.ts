@@ -1,4 +1,5 @@
 import { fetchDataSchemaForEmpresaId, createServiceRoleClientWithDbSchema } from "@/lib/supabase/empresa-data-schema";
+import { findInheritableRevendedor } from "@/lib/sorteos/referral-inheritance";
 import { isParticipanteBloqueado } from "@/lib/sorteos/participante-bloqueo";
 import { SUPABASE_APP_SCHEMA, type AppSupabaseClient } from "@/lib/supabase/schema";
 import {
@@ -1243,6 +1244,35 @@ export async function ensureSorteoOrderFromChat(
     if (revendedorId) {
       rpcPayload.revendedor_id = revendedorId;
       rpcPayload.codigo_referido = codigoReferidoSnap ?? "";
+    }
+  }
+
+  // Respaldo: la sesión de esta compra no trae revendedor (p. ej. un reinicio que no lo copió).
+  // Se usa el último revendedor que usó este chat y, si no hay, `first_revendedor_id`; SIEMPRE
+  // activo y del MISMO sorteo de esta orden (sin remapeos: nunca cross-acredita otro sorteo).
+  if (!revendedorId) {
+    const dbRevendedorFb =
+      dataSchema === SUPABASE_APP_SCHEMA ? supabase : createServiceRoleClientWithDbSchema(dataSchema);
+    const inh = await findInheritableRevendedor({
+      chatDb: supabase,
+      revDb: dbRevendedorFb,
+      empresaId: input.empresaId,
+      conversationId: input.conversationId,
+      sorteoId,
+      includeFirstRevendedor: true,
+    });
+    if (inh) {
+      revendedorId = inh.revendedorId;
+      codigoReferidoSnap = inh.codigo;
+      rpcPayload.revendedor_id = revendedorId;
+      rpcPayload.codigo_referido = codigoReferidoSnap ?? "";
+      console.info(FLOW_SORTEO_LOG, "revendedor_inherited_for_order", {
+        empresa_id: input.empresaId,
+        sorteo_id: sorteoId,
+        conversation_id: input.conversationId,
+        revendedor_id: revendedorId,
+        origen: inh.origen,
+      });
     }
   }
 

@@ -1,5 +1,6 @@
 import type { SupabaseAdmin } from "@/lib/chat/types";
 import { extractReferralTokenFromInboundText } from "@/lib/sorteos/referral-inbound-text";
+import { REFERRAL_SOURCE_INHERITED } from "@/lib/sorteos/referral-inheritance";
 
 const LOG = "[sorteo-referral]" as const;
 
@@ -77,7 +78,7 @@ export async function applySorteoReferralToActiveSession(
 
   const { data: sessionRow, error: sErr } = await params.supabase
     .from("chat_flow_sessions")
-    .select("id, revendedor_id, empresa_id, conversation_id")
+    .select("id, revendedor_id, empresa_id, conversation_id, referral_source")
     .eq("id", sid)
     .eq("empresa_id", params.empresaId)
     .maybeSingle();
@@ -103,7 +104,9 @@ export async function applySorteoReferralToActiveSession(
     activeFlowSessionId: partialUuid(sid),
   });
 
-  if (existingRev) {
+  const existingIsInherited =
+    (sessionRow as { referral_source?: string | null }).referral_source === REFERRAL_SOURCE_INHERITED;
+  if (existingRev && !existingIsInherited) {
     console.info(LOG, "early_exit", { reason: "session_already_has_revendedor" });
     return;
   }
@@ -220,7 +223,8 @@ export async function applySorteoReferralToActiveSession(
       })
       .eq("id", sid)
       .eq("empresa_id", params.empresaId)
-      .is("revendedor_id", null);
+      // Sin revendedor, o con uno solo heredado de un reinicio: un link/código nuevo manda.
+    .or(`revendedor_id.is.null,referral_source.eq.${REFERRAL_SOURCE_INHERITED}`);
 
     if (upSess) {
       console.warn(LOG, "session_update_click_failed", upSess.message);
@@ -302,7 +306,8 @@ export async function applySorteoReferralToActiveSession(
     })
     .eq("id", sid)
     .eq("empresa_id", params.empresaId)
-    .is("revendedor_id", null);
+    // Sin revendedor, o con uno solo heredado de un reinicio: un link/código nuevo manda.
+    .or(`revendedor_id.is.null,referral_source.eq.${REFERRAL_SOURCE_INHERITED}`);
 
   if (upSess2) {
     console.warn(LOG, "session_update_code_failed", upSess2.message);

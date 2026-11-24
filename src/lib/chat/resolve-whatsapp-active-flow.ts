@@ -1,6 +1,7 @@
 import { COMPROBANTE_BUTTON_IDS } from "@/lib/chat/comprobante-validation-types";
 import { flowTrace } from "@/lib/chat/flow-trace-log";
 import type { SupabaseAdmin } from "@/lib/chat/types";
+import { findInheritableRevendedor, REFERRAL_SOURCE_INHERITED } from "@/lib/sorteos/referral-inheritance";
 import {
   insertActiveFlowSessionRow,
   markConversationActiveSessionsEnded,
@@ -370,6 +371,71 @@ export type RestartWhatsappConversationOpts = {
 };
 
 /**
+ * Copia a la sesión recién creada el último revendedor válido del chat (activo y del sorteo del flujo).
+ * Queda marcado `referral_source = "heredado"` para que un link/código nuevo lo pueda reemplazar.
+ * Nunca lanza: ante cualquier error la sesión sigue sin revendedor (comportamiento previo).
+ */
+async function inheritReferralIntoRestartedSession(
+  supabase: SupabaseAdmin,
+  empresaId: string,
+  conversationId: string,
+  newSessionId: string,
+  targetFlow: string | null,
+  previousActiveFlowSessionId: string | null,
+  trigger: string
+): Promise<boolean> {
+  try {
+    const fc = targetFlow?.trim();
+    if (!fc) return false;
+    const { data: flowRow, error: flowErr } = await supabase
+      .from("chat_flows")
+      .select("sorteo_id")
+      .eq("empresa_id", empresaId)
+      .eq("flow_code", fc)
+      .maybeSingle();
+    const sorteoId = (flowRow as { sorteo_id?: string | null } | null)?.sorteo_id?.trim() || null;
+    if (flowErr || !sorteoId) return false;
+    const inh = await findInheritableRevendedor({
+      chatDb: supabase,
+      revDb: supabase,
+      empresaId,
+      conversationId,
+      sorteoId,
+      preferSessionId: previousActiveFlowSessionId,
+      excludeSessionId: newSessionId,
+    });
+    if (!inh) return false;
+    const { error: upErr } = await supabase
+      .from("chat_flow_sessions")
+      .update({
+        revendedor_id: inh.revendedorId,
+        codigo_referido_snapshot: inh.codigo,
+        referral_source: REFERRAL_SOURCE_INHERITED,
+      })
+      .eq("id", newSessionId)
+      .eq("empresa_id", empresaId)
+      .is("revendedor_id", null);
+    if (upErr) {
+      console.warn(FLOW_RESTART, "inherit_referral_failed", { conversationId, message: upErr.message });
+      return false;
+    }
+    console.info(FLOW_RESTART, "inherit_referral_ok", {
+      conversationId,
+      newSessionId,
+      revendedorId: inh.revendedorId,
+      trigger,
+    });
+    return true;
+  } catch (e) {
+    console.warn(FLOW_RESTART, "inherit_referral_failed", {
+      conversationId,
+      message: e instanceof Error ? e.message.slice(0, 160) : String(e).slice(0, 160),
+    });
+    return false;
+  }
+}
+
+/**
  * Reinicia conversación al primer nodo de un flujo activo.
  * - Un solo flujo activo en catálogo → ese.
  * - Varios: solo si `preferFlowCode` está en la lista activa; si no, no elige al azar.
@@ -484,7 +550,19 @@ export async function restartWhatsappConversationToFlowStart(
     return { flow_code: null, flow_current_node: null, restarted: false, reason: "session_create_failed" };
   }
 
-  if (opts.preserveReferralFromPreviousSession && previousActiveFlowSessionId) {
+  // Revendedor: se hereda en TODOS los reinicios del mismo chat (activo + mismo sorteo), también
+  // después de `compra_realizada` (puntero ya null). Ver referral-inheritance.ts.
+  const inheritedReferral = await inheritReferralIntoRestartedSession(
+    supabase,
+    empresaId,
+    conversationId,
+    newSessionId,
+    targetFlow,
+    previousActiveFlowSessionId,
+    opts.trigger
+  );
+
+  if (!inheritedReferral && opts.preserveReferralFromPreviousSession && previousActiveFlowSessionId) {
     const { data: prevSess } = await supabase
       .from("chat_flow_sessions")
       .select("revendedor_id, codigo_referido_snapshot, referral_source")
@@ -504,7 +582,7 @@ export async function restartWhatsappConversationToFlowStart(
         .update({
           revendedor_id: p.revendedor_id ?? null,
           codigo_referido_snapshot: p.codigo_referido_snapshot ?? null,
-          referral_source: p.referral_source ?? null,
+          referral_source: p.revendedor_id ? REFERRAL_SOURCE_INHERITED : (p.referral_source ?? null),
         })
         .eq("id", newSessionId)
         .eq("empresa_id", empresaId);
