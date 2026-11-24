@@ -10,9 +10,16 @@ import type { AppSupabaseClient } from "@/lib/supabase/schema";
  *
  * Reglas (para no cross-acreditar):
  *   - Solo se hereda un revendedor ACTIVO y del MISMO sorteo que el flujo actual (sin remapeos).
- *   - Lo heredado queda marcado con `referral_source = "heredado"`: un link o código nuevo lo reemplaza.
+ *   - Lo heredado queda con `referral_source` VACÍO (revendedor sí, origen no): un link o código nuevo
+ *     lo reemplaza. No se usa un valor propio porque la base tiene un CHECK
+ *     (`chat_flow_sessions_referral_source_check`) que solo admite NULL, click_token o inbound_text, y
+ *     las atribuciones directas siempre guardan uno de esos dos.
  */
-export const REFERRAL_SOURCE_INHERITED = "heredado" as const;
+
+/** Sesión con revendedor heredado de un reinicio (no atribuido por link/código en esta sesión). */
+export function isInheritedReferral(row: { revendedor_id?: string | null; referral_source?: string | null } | null): boolean {
+  return Boolean(row?.revendedor_id) && !(row?.referral_source ?? "").trim();
+}
 
 const LOG = "[sorteo-referral][inherit]" as const;
 

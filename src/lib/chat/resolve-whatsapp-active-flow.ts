@@ -1,7 +1,7 @@
 import { COMPROBANTE_BUTTON_IDS } from "@/lib/chat/comprobante-validation-types";
 import { flowTrace } from "@/lib/chat/flow-trace-log";
 import type { SupabaseAdmin } from "@/lib/chat/types";
-import { findInheritableRevendedor, REFERRAL_SOURCE_INHERITED } from "@/lib/sorteos/referral-inheritance";
+import { findInheritableRevendedor } from "@/lib/sorteos/referral-inheritance";
 import {
   insertActiveFlowSessionRow,
   markConversationActiveSessionsEnded,
@@ -372,7 +372,7 @@ export type RestartWhatsappConversationOpts = {
 
 /**
  * Copia a la sesión recién creada el último revendedor válido del chat (activo y del sorteo del flujo).
- * Queda marcado `referral_source = "heredado"` para que un link/código nuevo lo pueda reemplazar.
+ * Queda con `referral_source` NULL (= heredado) para que un link/código nuevo lo pueda reemplazar.
  * Nunca lanza: ante cualquier error la sesión sigue sin revendedor (comportamiento previo).
  */
 async function inheritReferralIntoRestartedSession(
@@ -410,7 +410,8 @@ async function inheritReferralIntoRestartedSession(
       .update({
         revendedor_id: inh.revendedorId,
         codigo_referido_snapshot: inh.codigo,
-        referral_source: REFERRAL_SOURCE_INHERITED,
+        // NULL = heredado (ver referral-inheritance.ts; el CHECK de la base no admite otro valor).
+        referral_source: null,
       })
       .eq("id", newSessionId)
       .eq("empresa_id", empresaId)
@@ -582,7 +583,7 @@ export async function restartWhatsappConversationToFlowStart(
         .update({
           revendedor_id: p.revendedor_id ?? null,
           codigo_referido_snapshot: p.codigo_referido_snapshot ?? null,
-          referral_source: p.revendedor_id ? REFERRAL_SOURCE_INHERITED : (p.referral_source ?? null),
+          referral_source: p.revendedor_id ? null : (p.referral_source ?? null),
         })
         .eq("id", newSessionId)
         .eq("empresa_id", empresaId);
