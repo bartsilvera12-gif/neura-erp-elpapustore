@@ -187,8 +187,11 @@ const MENU_STRUCTURE: MenuItem[] = [
     // La ruta /sorteos/tickets sigue existiendo (no se rompe).
     children:
       process.env.NEXT_PUBLIC_NEURA_CLIENT_SCHEMA === "elpapustore_erp"
-        ? undefined
-        : [{ label: "Tickets / Comprobantes", href: "/sorteos/tickets", exactMatch: true }],
+        ? [{ label: "Ventas por pauta", href: "/sorteos/pauta" }]
+        : [
+            { label: "Tickets / Comprobantes", href: "/sorteos/tickets", exactMatch: true },
+            { label: "Ventas por pauta", href: "/sorteos/pauta" },
+          ],
   },
   {
     key: "cupon_manual",
